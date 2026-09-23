@@ -4,6 +4,7 @@ import { api, type Upstream } from './api';
 const props = defineProps<{ account: Upstream }>();
 const emit = defineEmits<{ updated: [] }>();
 const pending = ref(false); const error = ref('');
+const AUTO_REFRESH_MS = 2 * 60 * 60 * 1000;
 const billing = computed(() => props.account.billing_source === 'upstream' ? props.account.billing : null);
 let timer: ReturnType<typeof setInterval> | undefined;
 let alive = true;
@@ -19,7 +20,7 @@ async function refresh() {
 }
 function autoRefresh() {
   const checked = props.account.billing_source === 'upstream' ? props.account.billing_checked_at || 0 : 0;
-  if (document.visibilityState === 'visible' && Date.now() - Math.max(checked, lastAttempt) > 300000) void refresh();
+  if (document.visibilityState === 'visible' && Date.now() - Math.max(checked, lastAttempt) > AUTO_REFRESH_MS) void refresh();
 }
 onMounted(() => { autoRefresh(); timer = setInterval(autoRefresh, 60000); document.addEventListener('visibilitychange', autoRefresh); });
 onBeforeUnmount(() => { alive = false; clearInterval(timer); document.removeEventListener('visibilitychange', autoRefresh); });
@@ -38,7 +39,7 @@ onBeforeUnmount(() => { alive = false; clearInterval(timer); document.removeEven
         <div><span>{{ entry.label }}</span><span v-if="entry.value">已用 {{ money(entry.value.used) }} / {{ money(entry.value.limit) }} · {{ Math.min(100, Math.max(0, entry.value.used / entry.value.limit * 100)).toFixed(1) }}%</span><span v-else>未确认</span></div>
         <template v-if="entry.value"><progress :value="Math.min(entry.value.used, entry.value.limit)" :max="entry.value.limit" :aria-label="`${entry.label}已用额度`" /><small>剩余 {{ money(entry.value.remaining) }} · 重置 {{ date(entry.value.resets_at) }}</small></template>
       </div>
-      <p>更新于 {{ date(billing.updated_at) }} · 页面可见时每 5 分钟自动同步</p>
+      <p>更新于 {{ date(billing.updated_at) }} · 页面可见时每 2 小时自动同步</p>
       <details><summary>账期与额度明细</summary><p>账期开始：{{ date(billing.period_start) }}<br />账期结束：{{ date(billing.period_end) }}</p><p v-if="billing.premium_remaining != null">高级模型余额：{{ money(billing.premium_remaining) }}</p><p v-if="billing.opensource_remaining != null">开源模型余额：{{ money(billing.opensource_remaining) }}</p><p>已用金额以官方统计周期为准；不同额度池可能重叠，不相加。</p></details>
     </template>
   </section>

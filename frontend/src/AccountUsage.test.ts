@@ -17,7 +17,7 @@ describe('AccountUsage', () => {
 
   it('renders official spend basis, zero/free balances, windows, and reset information', () => {
     const wrapper = mount(AccountUsage, { props: { account: account({ billing_source: 'upstream', billing, billing_checked_at: Date.now() }) as never } });
-    expect(wrapper.text()).toContain('本账期已用'); expect(wrapper.text()).toContain('月度剩余'); expect(wrapper.text()).toContain('充值剩余'); expect(wrapper.text()).toContain('月度总额度'); expect(wrapper.text()).toContain('75.0%'); expect(wrapper.text()).not.toContain('免费余额'); expect(wrapper.text()).toContain('5 小时'); expect(wrapper.text()).toContain('每周'); expect(wrapper.findAll('progress')).toHaveLength(3); expect(wrapper.findAll('progress')[0].attributes('max')).toBe('10'); expect(wrapper.findAll('progress')[0].attributes('value')).toBe('2'); expect(wrapper.findAll('progress')[2].attributes('max')).toBe('10'); expect(wrapper.findAll('progress')[2].attributes('value')).toBe('7.5'); wrapper.unmount();
+    expect(wrapper.text()).toContain('本账期已用'); expect(wrapper.text()).toContain('月度剩余'); expect(wrapper.text()).toContain('充值剩余'); expect(wrapper.text()).toContain('月度总额度'); expect(wrapper.text()).toContain('75.0%'); expect(wrapper.text()).not.toContain('免费余额'); expect(wrapper.text()).toContain('5 小时'); expect(wrapper.text()).toContain('每周'); expect(wrapper.text()).toContain('每 2 小时自动同步'); expect(wrapper.findAll('progress')).toHaveLength(3); expect(wrapper.findAll('progress')[0].attributes('max')).toBe('10'); expect(wrapper.findAll('progress')[0].attributes('value')).toBe('2'); expect(wrapper.findAll('progress')[2].attributes('max')).toBe('10'); expect(wrapper.findAll('progress')[2].attributes('value')).toBe('7.5'); wrapper.unmount();
   });
 
   it('does not invent a zero monthly cap when the plan is unknown', () => {
@@ -35,9 +35,10 @@ describe('AccountUsage', () => {
     expect(wrapper.text()).toContain('刷新失败'); expect(wrapper.emitted('updated')).toBeTruthy(); wrapper.unmount();
   });
 
-  it('refreshes after five minutes while visible and reacts to visibility changes', async () => {
+  it('refreshes after two hours while visible and reacts to visibility changes', async () => {
     vi.useFakeTimers(); mocks.api.mockResolvedValue({}); const wrapper = mount(AccountUsage, { props: { account: account({ billing_source: 'upstream', billing_checked_at: Date.now() }) as never } }); await flushPromises(); expect(mocks.api).not.toHaveBeenCalled();
-    vi.advanceTimersByTime(360_001); await flushPromises(); expect(mocks.api).toHaveBeenCalledTimes(1);
-    const beforeVisibility = mocks.api.mock.calls.length; vi.setSystemTime(Date.now() + 300_001); Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' }); document.dispatchEvent(new Event('visibilitychange')); await flushPromises(); expect(mocks.api.mock.calls.length).toBeGreaterThan(beforeVisibility); wrapper.unmount();
+    vi.advanceTimersByTime(300_001); await flushPromises(); expect(mocks.api).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(7_200_000); await flushPromises(); expect(mocks.api).toHaveBeenCalledTimes(1);
+    const beforeVisibility = mocks.api.mock.calls.length; vi.setSystemTime(Date.now() + 7_200_001); Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' }); document.dispatchEvent(new Event('visibilitychange')); await flushPromises(); expect(mocks.api.mock.calls.length).toBeGreaterThan(beforeVisibility); wrapper.unmount();
   });
 });
