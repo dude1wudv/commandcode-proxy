@@ -5,6 +5,10 @@ import { api, session, testStream, type Session, type Upstream, type Client, typ
 import Modal from './Modal.vue';
 import EntityDialog from './EntityDialog.vue';
 import AccountUsage from './AccountUsage.vue';
+import { Moon, Sun } from 'lucide-vue-next';
+import { useAppearance } from './useAppearance';
+
+const { isDark, toggleAppearance } = useAppearance();
 
 type Page = 'overview' | 'upstreams' | 'test' | 'models' | 'clients' | 'audit' | 'settings';
 const navigation = [
@@ -144,6 +148,7 @@ onBeforeUnmount(() => { clearInterval(timer); clearTimeout(noticeTimer); abortTe
 </script>
 
 <template>
+  <div class="glacier-scene" aria-hidden="true" />
   <div v-if="booting" class="boot-screen"><div class="brand-mark"><Terminal :size="25" /></div><span>正在连接工作空间…</span></div>
   <div v-else-if="!auth?.email" class="login-layout">
     <section class="login-story">
@@ -153,7 +158,7 @@ onBeforeUnmount(() => { clearInterval(timer); clearTimeout(noticeTimer); abortTe
       </div>
       <footer><span class="status-dot" /> 管理面与推理面严格隔离 <span>COMMANDCODE / CONSOLE</span></footer>
     </section>
-    <main class="login-form-area"><form class="login-form" @submit.prevent="login"><span class="eyebrow">WELCOME BACK</span><h2>登录管理控制台</h2><p>继续管理你的 AI 基础设施。</p><div v-if="loginError" class="notice error" role="alert">{{ loginError }}</div><label>管理员邮箱<input v-model="email" name="email" type="email" required autocomplete="username" /></label><label>密码<input v-model="password" name="password" type="password" required autocomplete="current-password" placeholder="输入管理员密码" /></label><button class="button primary login-button" :disabled="loggingIn">{{ loggingIn ? '正在验证…' : '进入工作空间' }}<ArrowRight :size="18" /></button><div class="login-security"><ShieldCheck :size="16" /><span>安全会话 · 受限访问 · 全程审计</span></div></form><span class="login-footnote">仅供授权管理员使用</span></main>
+    <main class="login-form-area"><button class="appearance-control login-appearance" :aria-label="isDark ? '切换浅色模式' : '切换深色模式'" :aria-pressed="isDark" @click="toggleAppearance"><Sun v-if="isDark" :size="16" /><Moon v-else :size="16" /><span>{{ isDark ? '浅色' : '深色' }}</span></button><form class="login-form" @submit.prevent="login"><span class="eyebrow">WELCOME BACK</span><h2>登录管理控制台</h2><p>继续管理你的 AI 基础设施。</p><div v-if="loginError" class="notice error" role="alert">{{ loginError }}</div><label>管理员邮箱<input v-model="email" name="email" type="email" required autocomplete="username" /></label><label>密码<input v-model="password" name="password" type="password" required autocomplete="current-password" placeholder="输入管理员密码" /></label><button class="button primary login-button" :disabled="loggingIn">{{ loggingIn ? '正在验证…' : '进入工作空间' }}<ArrowRight :size="18" /></button><div class="login-security"><ShieldCheck :size="16" /><span>安全会话 · 受限访问 · 全程审计</span></div></form><span class="login-footnote">仅供授权管理员使用</span></main>
   </div>
   <div v-else class="workspace">
     <div v-if="mobileNav" class="sidebar-shade" @click="mobileNav = false" />
@@ -164,7 +169,7 @@ onBeforeUnmount(() => { clearInterval(timer); clearTimeout(noticeTimer); abortTe
       <div class="sidebar-bottom"><div class="network-note"><ShieldCheck :size="19" /><div>推理接口仅内网开放<small>172.18.0.1:13050</small></div></div><button class="profile" @click="navigate('settings')"><span class="avatar">A</span><span>Administrator<small>工作空间管理员</small></span><Settings2 :size="17" /></button></div>
     </aside>
     <div class="workspace-main">
-      <header class="topbar"><div class="breadcrumb"><button class="icon-button menu-button" aria-label="打开导航" @click="mobileNav = true"><Menu :size="20" /></button><span>工作空间</span><ChevronRight :size="14" /><strong>{{ currentNav.label }}</strong></div><div class="topbar-actions"><span class="private-label"><span class="status-dot" /> 私有部署</span><span class="topbar-divider" /><button class="icon-button" :disabled="loading" aria-label="刷新数据" @click="reload()"><RefreshCw :size="17" :class="{ spinning: loading }" /></button><button class="icon-button" aria-label="退出登录" @click="logout"><LogOut :size="17" /></button></div></header>
+      <header class="topbar"><div class="breadcrumb"><button class="icon-button menu-button" aria-label="打开导航" @click="mobileNav = true"><Menu :size="20" /></button><span>工作空间</span><ChevronRight :size="14" /><strong>{{ currentNav.label }}</strong></div><div class="topbar-actions"><button class="appearance-control" :aria-label="isDark ? '切换浅色模式' : '切换深色模式'" :aria-pressed="isDark" @click="toggleAppearance"><Sparkles :size="15" /><span>冰川</span><Sun v-if="isDark" :size="16" /><Moon v-else :size="16" /></button><span class="private-label"><span class="status-dot" /> 私有部署</span><span class="topbar-divider" /><button class="icon-button" :disabled="loading" aria-label="刷新数据" @click="reload()"><RefreshCw :size="17" :class="{ spinning: loading }" /></button><button class="icon-button" aria-label="退出登录" @click="logout"><LogOut :size="17" /></button></div></header>
       <main class="page-content">
         <header class="page-heading"><div><span class="eyebrow">{{ page === 'overview' ? 'YOUR GATEWAY, AT A GLANCE' : 'COMMANDCODE / ' + page.toUpperCase() }}</span><h1>{{ page === 'overview' ? '工作空间总览' : currentNav.label }}<span v-if="page === 'overview'" class="heading-dot" /></h1><p>{{ { overview: '账号、模型与请求状态，一目了然。', upstreams: '让每个账号各尽其能，让每次请求有序抵达。', test: '从目录连通到真实生成，逐步验证上游状态。', models: '按账号精细配置模型，让可用能力清晰可控。', clients: '一个内网入口，为每个客户端划定独立边界。', audit: '每一次关键操作，都有迹可循。', settings: '管理你的凭据与会话，守护工作空间。' }[page] }}</p></div><button v-if="page === 'upstreams' || page === 'clients'" class="button primary" @click="editor = { kind: page }"><Plus :size="18" />{{ page === 'upstreams' ? '新建上游账号' : '创建客户端 API' }}</button><span v-else-if="page === 'overview'" class="date-chip">{{ new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' }) }}</span></header>
         <template v-if="page === 'overview'">
