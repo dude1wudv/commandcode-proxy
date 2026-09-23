@@ -64,3 +64,55 @@ test('changing the upstream credential rejects an in-flight old response and cle
 test('management billing refresh enforces auth/CSRF and deleted accounts return 404', async t => {
   const app = await createApplication({ databasePath: ':memory:', masterKey: MASTER_KEY, initialPassword: 'billing-test-password-123', origin: ORIGIN, apiBase: 'https://api.example.test' }); const managed = await listen(app.management); t.after(async () => { await close(managed.server); app.close(); }); const unauth = await call(managed.base, '/command/api/upstreams/no-id/billing/refresh', { method: 'POST', body: {} }); assert.equal(unauth.status, 401); const anonymous = await call(managed.base, '/command/api/auth/session'); const loginCookie = cookiePair(anonymous.res.headers, 'cc_login'); const login = await call(managed.base, '/command/api/auth/login', { method: 'POST', headers: { origin: ORIGIN, cookie: loginCookie, 'x-csrf-token': anonymous.body.csrf }, body: { email: 'admin@sub.sunmmyapi.xyz', password: 'billing-test-password-123' } }); const session = cookiePair(login.res.headers, 'cc_session'); const csrf = login.body.csrf; const created = await call(managed.base, '/command/api/upstreams', { method: 'POST', headers: { origin: ORIGIN, cookie: session, 'x-csrf-token': csrf }, body: { name: 'route account', notes: '', enabled: true, credential: 'user_route_secret', priority: 0, load_factor: 1, max_concurrency: 1, whitelist: [] } }); const id = created.body.id; const csrfFailure = await call(managed.base, `/command/api/upstreams/${id}/billing/refresh`, { method: 'POST', headers: { origin: ORIGIN, cookie: session }, body: {} }); assert.equal(csrfFailure.status, 403); assert.equal(csrfFailure.body.error.code, 'csrf_invalid'); const legacySession = await call(managed.base, `/command/api/upstreams/${id}/billing/session`, { method: 'PUT', headers: { origin: ORIGIN, cookie: session, 'x-csrf-token': csrf }, body: {} }); assert.equal(legacySession.status, 404); const deleted = await call(managed.base, `/command/api/upstreams/${id}`, { method: 'DELETE', headers: { origin: ORIGIN, cookie: session, 'x-csrf-token': csrf } }); assert.equal(deleted.status, 200); const missing = await call(managed.base, `/command/api/upstreams/${id}/billing/refresh`, { method: 'POST', headers: { origin: ORIGIN, cookie: session, 'x-csrf-token': csrf }, body: {} }); assert.equal(missing.status, 404);
 });
+
+test('billing refresh ignores the inference inflight budget and reports timeouts distinctly', async t => {
+  const app = await createApplication({
+    databasePath: ':memory:', masterKey: MASTER_KEY, initialPassword: 'billing-test-password-123',
+    origin: ORIGIN, apiBase: 'https://api.example.test', maxInflight: 0,
+  });
+  const managed = await listen(app.management);
+  t.after(async () => { await close(managed.server); app.close(); });
+  const anonymous = await call(managed.base, '/command/api/auth/session');
+  const loginCookie = cookiePair(anonymous.res.headers, 'cc_login');
+  const login = await call(managed.base, '/command/api/auth/login', {
+    method: 'POST', headers: { origin: ORIGIN, cookie: loginCookie, 'x-csrf-token': anonymous.body.csrf },
+    body: { email: 'admin@sub.sunmmyapi.xyz', password: 'billing-test-password-123' },
+  });
+  const session = cookiePair(login.res.headers, 'cc_session');
+  const csrf = login.body.csrf;
+  const created = await call(managed.base, '/command/api/upstreams', {
+    method: 'POST', headers: { origin: ORIGIN, cookie: session, 'x-csrf-token': csrf },
+    body: { name: 'budget account', notes: '', enabled: true, credential: 'user_budget_secret', priority: 0, load_factor: 1, max_concurrency: 1, whitelist: [] },
+  });
+  const id = created.body.id;
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  let n = 0;
+  globalThis.fetch = async (url, options) => {
+    if (!String(url).startsWith('https://api.example.test/')) return originalFetch(url, options);
+    n++;
+    if (n === 1) return response(200, who());
+    if (n === 2) return response(200, credits());
+    if (n === 3) return response(200, subscription());
+    return response(200, summary());
+  };
+  const ok = await call(managed.base, `/command/api/upstreams/${id}/billing/refresh`, {
+    method: 'POST', headers: { origin: ORIGIN, cookie: session, 'x-csrf-token': csrf }, body: {},
+  });
+  assert.equal(ok.status, 200, JSON.stringify(ok.body));
+  assert.equal(ok.body.billing.monthly_remaining, 12.5);
+
+  app.repo.save('upstreams', { ...app.repo.get('upstreams', id), billing_checked_at: Date.now() - 120_000, billing_error: null });
+  globalThis.fetch = async (url, options) => {
+    if (!String(url).startsWith('https://api.example.test/')) return originalFetch(url, options);
+    const error = new Error('The operation was aborted due to timeout');
+    error.name = 'TimeoutError';
+    throw error;
+  };
+  const timedOut = await call(managed.base, `/command/api/upstreams/${id}/billing/refresh`, {
+    method: 'POST', headers: { origin: ORIGIN, cookie: session, 'x-csrf-token': csrf }, body: {},
+  });
+  assert.equal(timedOut.status, 502);
+  assert.equal(timedOut.body.error.message, '官方账单请求超时，请稍后刷新');
+  assert.equal(app.repo.get('upstreams', id).billing_error, '官方账单请求超时，请稍后刷新');
+});

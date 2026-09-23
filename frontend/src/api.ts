@@ -31,9 +31,14 @@ export interface Overview {
 }
 let csrf = '';
 export class ApiError extends Error { constructor(public status: number, message: string, public code = '') { super(message); } }
+async function readJson(response: Response): Promise<any> {
+  const text = await response.text();
+  try { return text ? JSON.parse(text) : {}; }
+  catch { throw new ApiError(response.status || 502, '控制台连接中断，请稍后刷新', 'invalid_response'); }
+}
 export async function session(): Promise<Session> {
   const response = await fetch('/command/api/auth/session', { credentials: 'same-origin', cache: 'no-store' });
-  const data = await response.json();
+  const data = await readJson(response);
   if (response.status !== 401 && !response.ok) throw new ApiError(response.status, '无法连接管理服务');
   csrf = data.csrf || ''; return data;
 }
@@ -43,7 +48,7 @@ export async function api<T>(path: string, method = 'GET', body?: unknown): Prom
     headers: { ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...(method === 'GET' ? {} : { 'X-CSRF-Token': csrf }) },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  const data = await response.json();
+  const data = await readJson(response);
   if (!response.ok) {
     if (response.status === 401 && path !== '/auth/login') window.dispatchEvent(new Event('cc:unauthorized'));
     throw new ApiError(response.status, data.error?.message || '请求失败', data.error?.code);
