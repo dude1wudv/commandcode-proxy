@@ -31,6 +31,7 @@ const confirmation = ref<{ kind: 'upstreams' | 'clients' | 'sessions'; id: strin
 const grace = ref(0);
 const accountId = ref(''); const modelSearch = ref(''); const modelDraft = ref<string[]>([]); const manualModels = ref('');
 const testModel = ref(''); const prompt = ref('请简短回复：连接成功。'); const testing = ref(false); const output = ref(''); const events = ref<{ event: string; message: string; ms?: number }[]>([]);
+const testProtocol = ref<'chat' | 'responses'>('chat');
 const currentPassword = ref(''); const newPassword = ref(''); const repeatPassword = ref('');
 let abortTest: AbortController | undefined; let timer: ReturnType<typeof setInterval> | undefined; let noticeTimer: ReturnType<typeof setTimeout> | undefined;
 const currentNav = computed(() => navigation.find(n => n.id === page.value)!);
@@ -41,7 +42,7 @@ const catalog = computed(() => account.value?.models.filter(m => m.id.toLowerCas
 const testModels = computed(() => {
   const a = account.value; if (!a) return [];
   const rules = a.whitelist;
-  return [...new Set([...a.models.map(m => m.id), ...rules.filter(m => !m.endsWith('*'))])].filter(m => !rules.length || rules.some(rule => rule.endsWith('*') ? m.startsWith(rule.slice(0, -1)) : rule === m));
+  return [...new Set([...a.models.map(m => m.id), ...rules.filter(m => !m.endsWith('*'))])].filter(m => !rules.length || rules.some(rule => rule.endsWith('*') ? m.startsWith(rule.slice(0, -1)) : rule === m)).filter(m => testProtocol.value !== 'responses' || (a.provider_responses_enabled && a.models.some(entry => entry.id === m && entry.supported_endpoints?.includes('/responses'))));
 });
 const successRate = computed(() => overview.value?.requests ? Math.round(overview.value.successes / overview.value.requests * 100) : 0);
 const statusLabels: Record<string, string> = { ready: '就绪', untested: '待测试', disabled: '已停用', credential_error: '凭据异常', cooling: '冷却中', saturated: '并发已满', healthy: '健康', unknown: '未测试', degraded: '需关注' };
@@ -121,7 +122,7 @@ async function startTest() {
   if (testing.value) return;
   testing.value = true; output.value = ''; events.value = []; abortTest = new AbortController();
   try {
-    await testStream(accountId.value, { model: testModel.value, prompt: prompt.value }, abortTest.signal, (event, data) => {
+    await testStream(accountId.value, { model: testModel.value, prompt: prompt.value, protocol: testProtocol.value }, abortTest.signal, (event, data) => {
       if (event === 'text') { output.value += String(data.text || ''); return; }
       events.value.push({ event, message: event === 'done' && !data.success ? String(data.error || '测试失败') : eventLabels[event] || event, ms: typeof data.elapsed_ms === 'number' ? data.elapsed_ms : undefined });
       if (event === 'done' && !data.success) notify(String(data.error || '测试失败'), true);
@@ -188,6 +189,7 @@ onBeforeUnmount(() => { clearInterval(timer); clearTimeout(noticeTimer); abortTe
           <div class="usage-grid"><AccountUsage v-for="row in filteredUpstreams" :key="row.id" :account="row" @updated="reload(true)" /></div>
         </template>
         <template v-else-if="page === 'test'">
+          <div class="form-stack"><label>测试协议<select v-model="testProtocol" :disabled="testing"><option value="chat">Chat（保留现有兼容链路）</option><option value="responses">官方原生 Responses（需启用账号）</option></select></label></div>
           <div class="test-layout"><section class="panel test-config"><header class="panel-header"><div><h3>连接诊断</h3><p>人工测试绕过调度状态，不绕过模型权限</p></div><Terminal :size="19" /></header><div class="form-stack"><label>上游账号<select v-model="accountId" :disabled="testing"><option value="" disabled>请选择账号</option><option v-for="row in upstreams" :key="row.id" :value="row.id">{{ row.name }}</option></select></label><div class="test-step"><span>01</span><div><strong>验证凭据与模型目录</strong><p>检查基础网络，并拉取账号模型快照</p></div></div><button class="button secondary full-width" :disabled="!account || testing || !!busy" @click="refreshModels"><RefreshCw :size="16" :class="{ spinning: busy === 'refresh' }" />{{ busy === 'refresh' ? '正在验证…' : '测试连接 / 刷新目录' }}</button><div v-if="account?.models_error" class="notice error">{{ account.models_error }}</div><div class="test-step"><span>02</span><div><strong>最小真实生成</strong><p>此操作会向上游发送真实请求</p></div></div><label>测试模型<select v-model="testModel" :disabled="testing"><option value="" disabled>请先刷新目录或配置模型</option><option v-for="model in testModels" :key="model" :value="model">{{ model }}</option></select></label><label>测试提示词<textarea v-model="prompt" rows="3" maxlength="4000" :disabled="testing" /></label><button v-if="!testing" class="button primary full-width" :disabled="!account || !testModel || !prompt.trim() || !!busy" @click="startTest"><Play :size="16" />开始生成测试</button><button v-else class="button secondary full-width" @click="abortTest?.abort()"><Pause :size="16" />停止测试</button></div></section><section class="panel terminal-panel"><header class="terminal-header"><div><span class="terminal-dots"><i /><i /><i /></span><span>实时输出</span></div><span :class="['pill', testing ? 'ready' : 'neutral']">{{ testing ? 'STREAMING' : 'READY' }}</span></header><div class="test-timeline" aria-live="polite"><div v-for="(event, index) in events" :key="index"><span class="timeline-dot" /><span>{{ event.message }}</span><code v-if="event.ms !== undefined">{{ event.ms }} ms</code></div></div><pre v-if="output" class="test-output" aria-label="生成输出">{{ output }}</pre><div v-else-if="!events.length" class="terminal-empty"><Terminal :size="40" /><h3>等待一次连接</h3><p>选择账号和模型，实时观察<br />连接、首字节与生成结果。</p></div><div v-else-if="testing" class="terminal-wait"><span class="cursor" /> 等待上游内容…</div><footer class="terminal-footer"><ShieldCheck :size="14" /> 提示词与正文不会写入审计日志</footer></section></div>
         </template>
         <template v-else-if="page === 'models'">

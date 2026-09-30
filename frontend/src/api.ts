@@ -1,5 +1,5 @@
 export interface Session { email?: string; csrf: string; expires_at?: number }
-export interface Model { id: string }
+export interface Model { id: string; name?: string; context_length?: number; supported_endpoints?: string[] }
 export interface UsageWindow { used: number; limit: number; remaining: number; resets_at: number | null }
 export interface Billing {
   monthly?: UsageWindow | null;
@@ -10,6 +10,7 @@ export interface Billing {
 export interface Upstream {
   id: string; name: string; notes: string; enabled: boolean; whitelist: string[];
   priority: number; load_factor: number; max_concurrency: number; credential_prefix: string;
+  provider_responses_enabled?: boolean;
   proxy_label?: string | null;
   proxy_probe?: { success: boolean; exit_ip?: string; country_code?: string | null; country?: string | null; region?: string | null; city?: string | null; latency_ms?: number; checked_at: number; message?: string } | null;
   health: string; scheduling: string; inflight: number; cooldown_until: number;
@@ -56,7 +57,7 @@ export async function api<T>(path: string, method = 'GET', body?: unknown): Prom
   if (data.csrf) csrf = data.csrf;
   return data;
 }
-export async function testStream(id: string, body: { model: string; prompt: string }, signal: AbortSignal, onEvent: (event: string, data: Record<string, unknown>) => void) {
+export async function testStream(id: string, body: { model: string; prompt: string; protocol?: 'chat' | 'responses' }, signal: AbortSignal, onEvent: (event: string, data: Record<string, unknown>) => void) {
   const response = await fetch(`/command/api/upstreams/${id}/test`, {
     method: 'POST', credentials: 'same-origin', cache: 'no-store', signal,
     headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf }, body: JSON.stringify(body),

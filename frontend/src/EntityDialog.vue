@@ -5,7 +5,7 @@ import { api, type Upstream, type Client } from './api';
 const props = defineProps<{ kind: 'upstreams' | 'clients'; item?: Upstream | Client }>();
 const emit = defineEmits<{ close: []; saved: [value: Upstream | Client] }>();
 const source = props.item as Upstream | undefined;
-const form = reactive({ name: props.item?.name || '', notes: props.item?.notes || '', enabled: props.item?.enabled ?? true, credential: '', proxy_url: '', remove_proxy: false, priority: source?.priority ?? 0, load_factor: source?.load_factor ?? 1, max_concurrency: source?.max_concurrency ?? 2, whitelist: props.item?.whitelist.join('\n') || '', expires: (props.item as Client)?.expires_at ? localDate((props.item as Client).expires_at!) : '' });
+const form = reactive({ name: props.item?.name || '', notes: props.item?.notes || '', enabled: props.item?.enabled ?? true, credential: '', proxy_url: '', remove_proxy: false, provider_responses_enabled: source?.provider_responses_enabled ?? false, priority: source?.priority ?? 0, load_factor: source?.load_factor ?? 1, max_concurrency: source?.max_concurrency ?? 2, whitelist: props.item?.whitelist.join('\n') || '', expires: (props.item as Client)?.expires_at ? localDate((props.item as Client).expires_at!) : '' });
 const pending = ref(false); const error = ref('');
 function localDate(value: number) { const d = new Date(value); return new Date(value - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16); }
 async function save() {
@@ -13,7 +13,7 @@ async function save() {
   try {
     const data: Record<string, unknown> = { name: form.name, notes: form.notes, enabled: form.enabled, whitelist: form.whitelist.split(/[\n,，]/).map(x => x.trim()).filter(Boolean) };
     if (props.kind === 'upstreams') {
-      Object.assign(data, { priority: form.priority, load_factor: form.load_factor, max_concurrency: form.max_concurrency });
+      Object.assign(data, { priority: form.priority, load_factor: form.load_factor, max_concurrency: form.max_concurrency, provider_responses_enabled: form.provider_responses_enabled });
       if (form.credential || !props.item) data.credential = form.credential;
       if (form.remove_proxy) data.proxy_url = null;
       else if (form.proxy_url.trim()) data.proxy_url = form.proxy_url.trim();
@@ -34,6 +34,8 @@ async function save() {
         <label>上游凭据 <span class="optional">{{ item ? '留空则不修改' : '仅加密保存' }}</span><input v-model="form.credential" name="credential" type="password" :required="!item" autocomplete="new-password" placeholder="user_…" /></label>
         <label>账号专属代理 <span class="optional">{{ source?.proxy_label ? `当前：${source.proxy_label}；留空则不修改` : '可选，留空沿用全局设置' }}</span><input v-model="form.proxy_url" name="proxy_url" type="password" maxlength="2048" autocomplete="new-password" :disabled="form.remove_proxy" placeholder="socks5://user:pass@host:port 或 https://user:pass@host:port" /><small>每个上游账号可独立设置 HTTP、HTTPS 或 SOCKS5 代理，链接加密保存。</small></label>
         <label v-if="source?.proxy_label" class="check-label"><input v-model="form.remove_proxy" name="remove_proxy" type="checkbox" /><span>移除此账号的专属代理</span></label>
+        <label class="check-label"><input v-model="form.provider_responses_enabled" name="provider_responses_enabled" type="checkbox" /><span>启用官方原生 Responses</span></label>
+        <small>仅对已验证具备 Provider API 权限的账号开启（Go 不支持）。Chat/Messages 保持原链路；模型还须在白名单及官方 Responses 目录内。</small>
         <div class="form-grid thirds">
           <label>优先级<input v-model.number="form.priority" name="priority" type="number" min="0" max="1000" required /><small>数值越小越优先</small></label>
           <label>负载因子<input v-model.number="form.load_factor" name="load_factor" type="number" min="1" max="1000" required /><small>同层流量权重</small></label>

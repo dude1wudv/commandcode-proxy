@@ -2,13 +2,31 @@
 
 > [English Docs](README.md)
 
-将 Command Code API 转换为 OpenAI / Anthropic 兼容接口的反代代理。单文件，零外部依赖。
+带多账号管理控制台的 Command Code 反代代理，提供 OpenAI / Anthropic 兼容接口。
 
 逐条对齐官方 npm 包源码（`command-code@1.53.1`；`dist/cli.mjs` 只是压缩、**没有混淆**）。上游 npm 走到更高版本时代理只打**漂移告警**，不会静默改版本号（见[反检测](#反检测)）。
 
 **完整功能**：OpenAI Chat Completions / **Responses API（`/v1/responses`）** + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止）| 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
 
 **社区**: [Linux.do](https://linux.do) — 一个友好的中文技术社区。
+
+## 当前控制台：混合协议入口
+
+推理服务独立监听 3051，管理服务监听 3050。客户端使用控制台签发的 API key；上游 `user_` 凭据由服务端按账号解密注入，不能拿上游 key 直接替代客户端 key。
+
+| 推理 API 根路径 | 协议及上游 |
+|---|---|
+| `/v1` | 保留既有 Chat、Messages 和本地转译 Responses，仍走 CLI `/alpha/generate`；现有客户端无需改动 |
+| `/provider/v1` | 原生 `/responses` 直连官方 `/provider/v1/responses`；`/chat/completions` 仍接收并返回 Chat 格式，使用原兼容链路 |
+
+在上游账号编辑页明确开启“官方原生 Responses”，再刷新模型目录。只对已验证具有 Provider API 权限的账号启用；官方 Go 套餐无此权限。原生入口仅调度已启用账号，Responses 还要求模型在账号/客户端白名单交集及官方 `supported_endpoints` 内。目录公开并不证明套餐权限。
+
+两入口的 `/models` 返回各自可调度模型及端点；`responses_backend` 区分 `provider` 与 `cli`。新入口错误、限流或无可用账号不会自动回退旧入口，Chat 请求不会被强制改成 Responses。更换上游凭据后须重新验证、启用原生入口。
+
+原生 Responses 保留图片、工具数组、工具参数增量、加密推理及官方 usage；始终发送 `store:false`，拒绝服务端历史续接、后台任务和远程 MCP。客户端应发送完整历史并自行执行 MCP 工具。流缺少终态或含失败事件不会计为成功，`Retry-After` 原样传递；无自动重放。管理端生成测试默认 Chat，可选择原生 Responses。
+
+下文涉及单文件、直传 `user_`、3050 推理及 CLI 指纹的配置是旧独立代理行为参考；当前控制台以 `server.mjs`、管理页和上述双入口为准。
+
 
 ## 快速开始
 

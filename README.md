@@ -2,13 +2,27 @@
 
 > [中文文档](README_zh.md)
 
-A reverse proxy that converts Command Code API to OpenAI / Anthropic compatible endpoints. Single file, zero external dependencies.
+A multi-account Command Code reverse proxy with a management console and OpenAI / Anthropic compatible endpoints.
 
 Built by analyzing official CLI network traffic to accurately replicate the Command Code API request protocol, including device-fingerprint and lifecycle pre-requests.
 
 **Features**: OpenAI Chat Completions / **Responses API (`/v1/responses`)** + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
 
 **Community**: [Linux.do](https://linux.do) — a friendly Chinese tech community.
+
+## Current console: hybrid protocol roots
+
+Management listens on 3050; private inference listens on 3051. Authenticate with a console-issued client API key, not an upstream `user_` credential.
+
+- `/v1` preserves existing Chat, Messages and translated Responses via the CLI `/alpha/generate` backend.
+- `/provider/v1/responses` forwards native Responses to the official Provider API. `/provider/v1/chat/completions` still accepts and returns Chat format through the existing compatibility backend.
+- Enable `provider_responses_enabled` only on accounts whose Provider API permission has been verified, then refresh their catalogs. Go plans have no Provider API access. Native Responses additionally requires the model's reported `supported_endpoints` and both account/client ACLs.
+- Each root's `/models` describes its effective endpoints and `responses_backend` (`provider` or `cli`). Native failures never fall back to the CLI backend, and Chat is not forced into Responses. Replacing credentials disables native access until it is verified again.
+- Native input, images, tools, opaque reasoning, SSE deltas and usage are preserved. Requests always use `store:false`; server-side history, background requests and remote MCP tools are rejected. Send full history and execute MCP tools locally. Missing terminal events and failed streams are not counted as successful; `Retry-After` is retained and requests are not replayed.
+- Management generation tests default to Chat and can explicitly select native Responses.
+
+The single-file, upstream-key and CLI-fingerprint instructions below describe the older standalone backend. For the console, use `server.mjs`, the management UI and these two inference roots.
+
 
 ## Quick Start
 
