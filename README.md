@@ -99,8 +99,11 @@ commandcode/
 | `CC_DEVICE_PROJECT_DIR` | empty | Faked project directory → `deviceProjectDir` |
 | `CC_EMPTY_SYSTEM_PLACEHOLDER` | `true` | Space placeholder for a missing system prompt; `false` disables → `emptySystemPlaceholder` |
 | `CC_MAX_BODY_MB` | `100` | Max request body size in MB; oversized requests get `413` |
+| `CC_MAX_TOOL_IMAGE_MB` | `6` | Total per-request budget for tool screenshots (base64); older ones become a placeholder; `0` disables. See [Tool screenshot budget](#tool-screenshot-budget) |
 | `CC_STREAM_IDLE_MS` | `30000` | Streaming upstream read idle timeout; see [Upstream idle timeouts](#upstream-idle-timeouts) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | Non-streaming upstream read idle timeout |
+| `CC_UPSTREAM_RETRY_MAX` | `2` | Retries for upstream disconnects **before any byte is written downstream**; `0` disables; see [Upstream transient retry](#upstream-transient-retry) |
+| `CC_UPSTREAM_RETRY_BASE_MS` | `400` | Backoff base in ms; the actual delay is base × attempt number |
 | `CC_MAX_INFLIGHT` | `0` (unlimited) | In-process request cap; over-limit returns `503`; see [In-flight cap](#in-flight-cap-optional) |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | unset (disabled) | Drop the client once downstream backpressure blocks longer than this; see [Stalled clients](#stalled-clients-neither-reading-nor-disconnecting) |
 | `CC_KEEPALIVE_TIMEOUT_MS` | `65000` | Backend keep-alive timeout (`headersTimeout` is set to +1s automatically). **Must be larger than the reverse proxy's keepalive_timeout** — see [keep-alive ordering](#suggested-nginx-front) |
@@ -114,6 +117,28 @@ authority for actual retention and provider availability.
 **Request body limit**: independent of `config.json` — requests larger than **100 MB** are rejected with `HTTP 413` (the connection is kept alive and drained, not reset). Override with `CC_MAX_BODY_MB` (positive integer, unit: MB).
 
 > ⚠️ **Memory amplification**: a request body exists in several copies before it reaches upstream; measured peak ≈ body size × **5.1–7.4** (7 MB → +52 MB, 20 MB → +116 MB, while a request rejected with `413` costs only ×1.05). The default `CC_MAX_BODY_MB=100` therefore implies up to ~550 MB for a **single** request, and that limit is per-request, not global. See [Memory & Deployment](#memory--deployment).
+
+### Tool screenshot budget
+
+Images inside tool results are sent upstream as **separate** `image` blocks (an `input_image` inside
+`function_call_output.output` is no longer `JSON.stringify`-ed into the tool-result text). Base64 is extremely
+expensive once upstream tokenizes it as **text** — a single 2.76 MB Codex Desktop screenshot measured
+≈ **1.92M tokens**, blowing straight through a 1M window:
+
+```
+400 This model's maximum context length is 1048576 tokens. However, you requested
+    1986800 tokens (1922800 in the messages, 64000 in the completion)
+```
+
+Images are still **re-sent in full every turn**: one real session carried 11 screenshots ≈5.5 MB of base64,
+which — with the memory amplification above (×5.1–7.4) — pushed the proxy to `anon-rss 532 MB` and triggered a
+**global OOM** on a 1 GB box. `CC_MAX_TOOL_IMAGE_MB` (default `6`) keeps the **newest** images within budget
+(at least one) and replaces the rest with `[older tool screenshot omitted: image budget exceeded]`, so the model
+knows an image was dropped instead of assuming none ever existed. Only tool screenshots are affected; images
+you attach yourself are untouched.
+
+> Raise the budget if the model really needs every screenshot, but size memory as `budget × in-flight × 5–7`
+> (see [in-flight cap](#in-flight-cap-optional)).
 
 ### Upstream proxy (`upstreamProxy` / `CC_UPSTREAM_PROXY`)
 
@@ -312,6 +337,7 @@ The request side is translated: `input` (message array; items may omit `type`), 
 - **Stateless**: `previous_response_id` is not supported and answers `400` — send the full `input` every turn (the proxy stores no conversation history).
 - Errors use the Responses shape: `{"error":{"message":...,"type":...}}`.
 - Shares the same upstream call path, cache breakpoints and idle watchdog as `/v1/chat/completions`.
+- **First-token silence and keep-alive**: `response.created` / `response.in_progress` are emitted **immediately** once upstream returns `200`, and a `: keepalive` SSE comment follows every 5 s while waiting. Time-to-first-token for a reasoning model with a large prompt measured 15–40 s; that silent window used to put **zero bytes** on the wire, so intermediate layers (EdgeOne's origin idle timeout measured ~15 s) or client first-byte timeouts cut the connection — visible as nginx `499` with `body_bytes_sent=0` and a client retrying every 15 s. SSE comments must be ignored by clients per spec (`/v1/messages` uses `event: ping`, but Responses has no ping event and an unknown event type risks strict-parser errors).
 
 ```bash
 curl http://127.0.0.1:3050/v1/responses \
@@ -602,6 +628,50 @@ CC_STREAM_IDLE_MS=300000 npm start      # 5 minutes
 ```
 
 > ⚠️ A false kill costs more than one failed request: the abort returns `429 + retry_after`, the SDK retries automatically, and a retry **resends the entire context** — so each false kill re-pays the full prefill on long conversations.
+
+## Upstream Transient Retry
+
+The CC upstream sometimes kills a connection mid-stream at peak hours (peer RST/FIN), which surfaces in Node as
+`TypeError: terminated`. Before this change the proxy handed that straight to the client as
+`502 {"error":{"message":"Upstream error: terminated","type":"proxy_error"}}`.
+
+As long as **no byte has been written downstream yet**, the request never started from the client's point of view —
+so the proxy can absorb the blip internally instead of making the client eat a 502 and resend its whole context.
+
+- **Retry requires all four**: ① the upstream did not finish — either a transport-level drop (`terminated` /
+  `ECONNRESET` / `ECONNREFUSED` / `EPIPE` / `ETIMEDOUT` / `UND_ERR_SOCKET` / `socket hang up` / `other side closed` /
+  `fetch failed`), or a **clean peer FIN that carried no `finish` event at all** (the same class of truncation as an
+  RST); ② nothing written downstream yet (streaming: no header/event emitted; non-streaming: `headersSent` still
+  false); ③ the client is still connected; ④ the retry cap is not reached.
+- Once any header or event has gone downstream, the proxy **never retries** — the semantics are already committed and a
+  retry would duplicate text.
+- `STREAM_IDLE_TIMEOUT` (the `429` "reduce your context" signal) is deliberately passed through and is **never retried**.
+- If an upstream `error` event (`429` / `503` …) has already been parsed, the proxy does **not** retry, and if the
+  connection then drops it still surfaces that semantic error instead of overwriting it with a transport `502`
+  (reporting "upstream at capacity" as "the proxy broke" would be misleading).
+- A client that disconnects during the backoff abandons the retry — the client is gone, another upstream call would
+  only burn quota.
+- Retries are invisible to the client: it sees a single `200` whose body comes from the attempt that succeeded.
+
+| Env var | Default | Description |
+|---|---|---|
+| `CC_UPSTREAM_RETRY_MAX` | `2` | Max retries (3 attempts in total); `0` disables the behaviour |
+| `CC_UPSTREAM_RETRY_BASE_MS` | `400` | Backoff base in ms; the actual delay is base × attempt number |
+
+Logs to look for: `Upstream stream terminated before first byte - retrying` / `Upstream error before first byte - retrying` /
+`Upstream stream ended incomplete before first byte - retrying` (a retry happened; `attempt` / `maxAttempts` / `cause`
+or `reason` are in the structured fields), `Upstream retry recovered` (the retry **actually delivered** a normal
+response) and `Upstream retry abandoned (client disconnected during backoff)`. The startup banner's `upstreamRetry`
+field shows the effective values.
+
+```bash
+CC_UPSTREAM_RETRY_MAX=0 npm start        # disable retries (behaviour reverts to before this change)
+CC_UPSTREAM_RETRY_BASE_MS=800 npm start  # wider backoff (default 400ms)
+```
+
+> **Scope**: the retry loop covers both the streaming and non-streaming paths of `/v1/chat/completions`.
+> `/v1/messages` and `/v1/responses` have a different structure and are not covered by this change (drops are still
+> reported as before).
 
 ## Memory & Deployment
 

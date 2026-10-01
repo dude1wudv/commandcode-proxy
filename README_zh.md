@@ -103,8 +103,11 @@ commandcode/
 | `CC_DEVICE_PROJECT_DIR` | 空 | 伪装的项目目录 → `deviceProjectDir` |
 | `CC_EMPTY_SYSTEM_PLACEHOLDER` | `true` | 无 system prompt 时发空格占位；`false` 关掉 → `emptySystemPlaceholder` |
 | `CC_MAX_BODY_MB` | `100` | 请求体上限（MB），超限返回 `413` |
+| `CC_MAX_TOOL_IMAGE_MB` | `6` | 单请求内工具截图（base64）总预算，超预算的老图换成占位；`0` 关闭，见[工具截图预算](#工具截图预算) |
 | `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时，见[上游空闲超时](#上游空闲超时) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式上游读空闲超时（同上）|
+| `CC_UPSTREAM_RETRY_MAX` | `2` | 上游「未吐字前闪断」的内部重试次数；`0` = 关闭，见[上游闪断重试](#上游闪断重试) |
+| `CC_UPSTREAM_RETRY_BASE_MS` | `400` | 重试退避基数（毫秒），实际退避 = base × 尝试序号 |
 | `CC_MAX_INFLIGHT` | `0`（不限）| 进程内在途请求上限，超限 `503`，见[在途上限](#在途请求上限可选) |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数就断开该客户端，见[僵死连接](#僵死连接既不读也不断开) |
 | `CC_KEEPALIVE_TIMEOUT_MS` | `65000` | 后端 keep-alive 时长（`headersTimeout` 自动 +1s）。**必须大于反代侧的 keepalive_timeout**，见 [keep-alive 时序](#nginx-反代建议) |
@@ -116,6 +119,25 @@ header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数�
 **请求体上限**：独立于 `config.json` —— 超过 **100MB** 的请求会被拒绝并返回 `HTTP 413`（连接保持可排空，不会直接 reset）。可用 `CC_MAX_BODY_MB`（正整数，单位 MB）覆盖。
 
 > ⚠️ **内存放大**：请求体在转发到上游前会存在多份副本，实测峰值 ≈ body 大小 × **5.1~7.4**（7MB→+52MB、20MB→+116MB；被 `413` 拒绝的请求只要 ×1.05）。因此默认 `CC_MAX_BODY_MB=100` 意味着**单个请求**最坏可吃 ~550MB，且该上限是每请求的、不是全局的。详见[内存与部署](#内存与部署)。
+
+### 工具截图预算
+
+工具结果里的图片会**单独**作为 `image` 块发给上游（`function_call_output.output` 里的 `input_image`
+不再被 `JSON.stringify` 进 tool-result 文本）。原因是 base64 一旦被上游按**文本**分词就极其昂贵 ——
+真机实测 Codex Desktop 单张 2.76MB 截图 ≈ **1.92M token**，直接撞穿模型的 1M 窗口：
+
+```
+400 This model's maximum context length is 1048576 tokens. However, you requested
+    1986800 tokens (1922800 in the messages, 64000 in the completion)
+```
+
+但图片仍会随每一轮请求**全量重传**：真机实测一个会话里 11 张截图 ≈5.5MB base64，配合上面的内存放大
+×5.1~7.4，在 1GB 的机器上足以把代理顶到 `anon-rss 532MB` 并触发 **global OOM**（内核杀掉 node，
+整机假死）。`CC_MAX_TOOL_IMAGE_MB`（默认 `6`）按**从新到旧**保留到预算之内（至少保一张），被裁掉的
+替换成 `[older tool screenshot omitted: image budget exceeded]` —— 模型知道有图被丢，不会以为历史里
+本来就没图。只作用于工具截图，用户自己贴的图不受影响。
+
+> 想让模型看到全部截图就调大预算，但请按 `预算 × 并发 × 5~7` 估内存（并发见[在途上限](#在途请求上限可选)）。
 
 ### 上游代理（`upstreamProxy` / `CC_UPSTREAM_PROXY`）
 
@@ -314,6 +336,7 @@ OpenAI **Responses API**（Codex、以及新版 OpenAI SDK 用的那套）。
 - **无状态**：`previous_response_id` 不支持，传了直接 `400` —— 每轮把完整 `input` 发过来即可（代理不存会话历史）。
 - 错误体是 Responses 风格：`{"error":{"message":...,"type":...}}`。
 - 与 `/v1/chat/completions` 共用同一套上游调用、缓存断点与空闲看门狗。
+- **首字静默与保活**：拿到上游 `200` 后**立刻**下发 `response.created` / `response.in_progress`，此后等待期间每 5s 发一条 SSE 注释行 `: keepalive`。reasoning 模型 + 大 prompt 的首字实测 15~40s，这段静默期此前**零字节出网**，会被中间层（实测 EdgeOne 源站空闲超时约 15s）或客户端首字节超时掐断 —— 现象是 nginx 侧 `499`、`body_bytes_sent=0`、客户端每 15 秒重试一次。注释行按 SSE 规范必须被客户端忽略（`/v1/messages` 用的是 `event: ping`，Responses 没有 ping 事件，塞未知 event 类型有被严格解析器判错的风险）。
 
 ```bash
 curl http://127.0.0.1:3050/v1/responses \
@@ -610,6 +633,45 @@ CC_STREAM_IDLE_MS=300000 npm start      # 5 分钟
 
 > ⚠️ 误杀的成本不止一次失败：被 abort 后返回 `429 + retry_after`，SDK 会自动重试，
 > 而重试等于**完整重发整个上下文**，长会话下每次误杀都要重付一次全量 prefill。
+
+## 上游闪断重试
+
+CC 上游在高峰期会中途掐断连接（对端 RST/FIN），undici 抛 `TypeError: terminated`；改动前这类闪断会原样回给下游
+`502 {"error":{"message":"Upstream error: terminated","type":"proxy_error"}}`。
+
+只要**此刻尚未向下游写出任何字节**，这个请求对下游而言从未开始过 —— 代理内部重试即可消化掉抖动，
+下游（CPA / 客户端）不必先吃一个 502 再自己重试（那等于完整重发整个上下文）。
+
+- **重试条件（需同时满足）**：① 上游没走完 —— 传输层闪断（`terminated` / `ECONNRESET` / `ECONNREFUSED` /
+  `EPIPE` / `ETIMEDOUT` / `UND_ERR_SOCKET` / `socket hang up` / `other side closed` / `fetch failed`），
+  或对端**干净收尾但整条流里没有 finish 事件**（FIN 截断，与 RST 同类）；
+  ② 尚未向下游写出任何字节（流式看是否已写出 header / 事件，非流式看 `headersSent`）；
+  ③ 客户端没断连；④ 未达重试上限。
+- 一旦已经向下游写过头或事件，**绝不重试**：语义已提交，重试只会让下游看到重复文本。
+- `STREAM_IDLE_TIMEOUT`（`429`「请减少上下文」）是刻意传给下游的信号，**不重试**。
+- 已解析到上游 `error` 事件（`429` / `503` 等）时**不重试**：连接随后再断，也优先把这条语义错误透出，
+  而不是用传输层错误覆盖成 `502`（把「上游容量不足」说成「代理挂了」是误导）。
+- 退避期间客户端断连 → 放弃重试（下游已经走了，再打一次上游只是白烧额度）。
+- 重试对下游完全透明：下游只看到一次 200（内容来自重试成功的那一次）。
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `CC_UPSTREAM_RETRY_MAX` | `2` | 最大重试次数（共 3 次尝试）；`0` = 关闭本行为 |
+| `CC_UPSTREAM_RETRY_BASE_MS` | `400` | 退避基数（毫秒），实际退避 = base × 尝试序号 |
+
+日志里可复盘：`Upstream stream terminated before first byte - retrying` / `Upstream error before first byte - retrying` /
+`Upstream stream ended incomplete before first byte - retrying`（发生了一次重试，`attempt` / `maxAttempts` / `cause`
+或 `reason` 都在结构体里）、`Upstream retry recovered`（重试后**确实**交付了正常响应）、
+`Upstream retry abandoned (client disconnected during backoff)`（退避期间客户端走了，放弃重试）；
+启动横幅的 `upstreamRetry` 字段可直接确认生效值。
+
+```bash
+CC_UPSTREAM_RETRY_MAX=0 npm start        # 关闭重试，行为退回改动前
+CC_UPSTREAM_RETRY_BASE_MS=800 npm start  # 退避拉长（默认 400ms）
+```
+
+> **覆盖范围**：目前 `/v1/chat/completions` 的流式与非流式两条路径都接了重试循环；
+> `/v1/messages` 与 `/v1/responses` 结构不同，未在本次改动中覆盖（闪断仍按原样报错）。
 
 ## 内存与部署
 
