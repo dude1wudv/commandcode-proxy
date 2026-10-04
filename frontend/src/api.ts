@@ -1,5 +1,6 @@
 export interface Session { email?: string; csrf: string; expires_at?: number }
 export interface Model { id: string; name?: string; context_length?: number; supported_endpoints?: string[] }
+export interface Group { id: string; name: string; notes: string; created_at?: number }
 export interface UsageWindow { used: number; limit: number; remaining: number; resets_at: number | null }
 export interface Billing {
   monthly?: UsageWindow | null;
@@ -8,6 +9,7 @@ export interface Billing {
   five_hour: UsageWindow | null; weekly: UsageWindow | null; period_end: number | null; updated_at: number;
 }
 export interface Upstream {
+  group_id?: string;
   id: string; name: string; notes: string; enabled: boolean; whitelist: string[];
   priority: number; load_factor: number; max_concurrency: number; credential_prefix: string;
   provider_responses_enabled?: boolean;
@@ -20,6 +22,7 @@ export interface Upstream {
   billing_source?: string | null; billing?: Billing | null; billing_error?: string | null; billing_checked_at?: number | null;
 }
 export interface Client {
+  group_id?: string;
   id: string; name: string; notes: string; enabled: boolean; whitelist: string[];
   expires_at: number | null; key_prefix: string; requests: number; successes: number;
   errors: number; last_used_at: number | null; key?: string;

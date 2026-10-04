@@ -14,6 +14,14 @@ Built by analyzing official CLI network traffic to accurately replicate the Comm
 
 Management listens on 3050; private inference listens on 3051. Authenticate with a console-issued client API key, not an upstream `user_` credential.
 
+### Account groups and outlet keys
+
+Use **分组管理** to create or rename account pools. Select **所属分组** when creating or editing an upstream account or client API key. Each client key can list models and send requests only through accounts in its group, for both `/v1` and `/provider/v1`. Existing account/client model allowlists, priority, weights, concurrency, cooldowns and native Responses permissions still apply within the group. An empty or unavailable group never falls back to another group.
+
+The version 2 SQLite migration atomically assigns all existing accounts and clients to **默认分组** (`default`). Credentials, account settings, statistics, sessions and existing key hashes remain unchanged; clients do not need to replace their keys. The default group cannot be deleted, and other groups must be empty before deletion. Moving a client also moves the scope of every key in its rotation grace period. New accounts and clients default to this group when `group_id` is omitted. Authenticated group management uses `/command/api/groups`; account/client create and update requests accept `group_id`.
+
+Back up SQLite on the server before deployment. Older versions ignore group bindings: after configuring separate groups, do not downgrade to a version without groups while isolated keys remain enabled.
+
 - `/v1` preserves existing Chat, Messages and translated Responses via the CLI `/alpha/generate` backend.
 - `/provider/v1/responses` forwards native Responses to the official Provider API. `/provider/v1/chat/completions` still accepts and returns Chat format through the existing compatibility backend.
 - Enable `provider_responses_enabled` only on accounts whose Provider API permission has been verified, then refresh their catalogs. Go plans have no Provider API access. Native Responses additionally requires the model's reported `supported_endpoints` and both account/client ACLs.

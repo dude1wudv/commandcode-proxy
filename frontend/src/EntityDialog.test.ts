@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mount } from '@vue/test-utils';
+import { flushPromises, mount } from '@vue/test-utils';
 import EntityDialog from './EntityDialog.vue';
 
 const upstream = {
@@ -42,6 +42,48 @@ describe('EntityDialog native Responses account setting', () => {
     const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
     expect(init.method).toBe('POST');
     expect(JSON.parse(String(init.body))).toMatchObject({ provider_responses_enabled: false });
+    wrapper.unmount();
+  });
+});
+
+describe('EntityDialog group membership', () => {
+  const groups = [{ id: 'default', name: '默认分组', notes: '' }, { id: 'pool-b', name: '独立分组', notes: '' }];
+  it('moves an account with an explicit group binding while preserving native permission', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(upstream), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const wrapper = mount(EntityDialog, { props: { kind: 'upstreams', item: { ...upstream, group_id: 'pool-b' }, groups } });
+    expect((wrapper.find('select[name="group_id"]').element as HTMLSelectElement).value).toBe('pool-b');
+    await wrapper.find('select[name="group_id"]').setValue('default');
+    await wrapper.find('form').trigger('submit');
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toMatchObject({ group_id: 'default', provider_responses_enabled: false });
+    wrapper.unmount();
+  });
+  it('creates an outlet key in the selected group', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ id: 'client', key: 'synthetic-key' }), { status: 201 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const wrapper = mount(EntityDialog, { props: { kind: 'clients', groups, defaultGroupId: 'pool-b' } });
+    expect((wrapper.find('select[name="group_id"]').element as HTMLSelectElement).value).toBe('pool-b');
+    await wrapper.find('input[name="name"]').setValue('Scoped client');
+    await wrapper.find('select[name="group_id"]').setValue('pool-b');
+    await wrapper.find('form').trigger('submit');
+    await flushPromises();
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('/command/api/clients');
+    expect(JSON.parse(String(init.body))).toMatchObject({ group_id: 'pool-b' });
+    expect(wrapper.emitted('saved')?.[0]?.[0]).toMatchObject({ key: 'synthetic-key' });
+    wrapper.unmount();
+  });
+  it('creates a group using only its name and notes', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(groups[1]), { status: 201 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const wrapper = mount(EntityDialog, { props: { kind: 'groups', groups } });
+    expect(wrapper.find('select[name="group_id"]').exists()).toBe(false);
+    await wrapper.find('input[name="name"]').setValue('独立分组');
+    await wrapper.find('form').trigger('submit');
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe('/command/api/groups');
+    expect(JSON.parse(String(init.body))).toEqual({ name: '独立分组', notes: '' });
     wrapper.unmount();
   });
 });
