@@ -2,6 +2,7 @@
  * Command Code → OpenAI 兼容代理
  * 基于真实 CLI 流量抓包数据构建
  */
+import { quotaError } from './lib/quota-error.mjs';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
@@ -945,7 +946,9 @@ const CC_STATUS_MAP = {
   503: { status: 503, type: 'temporarily_unavailable' },
 };
 
-function mapCcError(ccStatus, ccBody) {
+export function mapCcError(ccStatus, ccBody) {
+  const quota = quotaError(requestContext.getStore(), ccBody, ccStatus);
+  if (quota) return quota;
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
   const context = requestContext.getStore();
   if (context) context.status = ccStatus;
@@ -972,7 +975,7 @@ function mapCcError(ccStatus, ccBody) {
   return { status: mapped.status, code, body: { error: { message, type: mapped.type, ...(code ? { code } : {}) } } };
 }
 
-function mapCcEventError(event) {
+export function mapCcEventError(event) {
   const message = event.error?.message || event.message || '';
   const code = event.error?.code || event.code || null;
   // 上游 error 事件除了 message 还可能自带 statusCode / isRetryable ——
@@ -986,6 +989,8 @@ function mapCcEventError(event) {
     ? Number(statusMatch[1])
     : (Number.isInteger(event.error?.statusCode) ? event.error.statusCode : null);
   const ccStatus = reportedStatus ?? 502;
+  const quota = quotaError(requestContext.getStore(), event.error || event, ccStatus);
+  if (quota) return { ...quota, reportedStatus };
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
 
   // 与 mapCcError 保持一致：终态为 429 时带上 retry_after，
@@ -2240,7 +2245,7 @@ async function handleMessages(req, res) {
       const errorText = await ccResponse.text().catch(() => '');
       const mapped = mapCcError(ccResponse.status, errorText);
       log('error', 'CC API error (Anthropic)', { status: ccResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
-      sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
+      sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message, mapped.body.retry_after);
       return;
     }
 
@@ -2497,7 +2502,7 @@ async function handleMessages(req, res) {
           log('warn', 'Upstream stream incomplete', { path: '/v1/messages', reason: incomplete });
           const err = incompleteUpstreamError(incomplete);
           try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
-          sendAnthropicError(res, err.status, err.body.error.type, err.body.error.message, err.retry_after);
+          sendAnthropicError(res, err.status, err.body.error.type, err.body.error.message, err.body.retry_after);
           return;
         }
       }
@@ -3392,7 +3397,7 @@ async function handleResponses(req, res) {
           log('warn', 'Upstream stream incomplete', { path: '/v1/responses', reason: incomplete });
           const err = incompleteUpstreamError(incomplete);
           try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
-          sendResponsesError(res, err.status, err.body.error.type, err.body.error.message, err.retry_after);
+          sendResponsesError(res, err.status, err.body.error.type, err.body.error.message, err.body.retry_after);
           return;
         }
       }

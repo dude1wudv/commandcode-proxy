@@ -272,3 +272,50 @@ test('an ordinary concurrent success cannot clear credential-error isolation', t
   assert.equal(account.last_error, originalError);
   assertHttpError(() => f.scheduler.acquire('model-a', client()), 503, 'no_available_upstream');
 });
+
+
+test('insufficient credit cooldown survives stale success and catalog refresh, then expires', t => {
+  const f = fixture(t);
+  const id = f.add({ name: 'paid' });
+  const fallback = f.add({ name: 'backup', priority: 2 });
+  f.scheduler.result(id, { status: 400, errorCode: 'insufficient_quota' });
+  const blocked = f.repo.get('upstreams', id);
+  assert.equal(blocked.cooldown_until, f.now() + 20 * 60 * 1000);
+  assert.equal(blocked.cooldown_reason, 'insufficient_quota');
+  assert.match(blocked.last_error, /余额不足/);
+  for (const options of [{}, { manual: true }, { manual: true, generationTest: true, quotaGeneration: 0 }]) {
+    f.scheduler.result(id, { status: 200, ...options });
+    assert.equal(f.scheduler.state(f.repo.get('upstreams', id)), 'cooling');
+    assert.equal(f.repo.get('upstreams', id).last_error, blocked.last_error);
+  }
+  const lease = f.scheduler.acquire('model-a', client());
+  assert.equal(lease.account.id, fallback);
+  lease.release();
+  f.advance(20 * 60 * 1000);
+  const recovered = f.scheduler.acquire('model-a', client());
+  assert.equal(recovered.account.id, id);
+  recovered.release();
+});
+
+test('quota cooldown only extends existing deadlines and a fresh generation test can recover', t => {
+  const f = fixture(t);
+  const id = f.add({ name: 'paid', cooldown_until: f.now() + 60 * 60 * 1000 });
+  f.scheduler.result(id, { status: 402 });
+  const generation = f.repo.get('upstreams', id).quota_generation;
+  assert.equal(f.repo.get('upstreams', id).cooldown_until, f.now() + 60 * 60 * 1000);
+  f.scheduler.result(id, { status: 429, retryAfter: '1' });
+  assert.equal(f.repo.get('upstreams', id).cooldown_until, f.now() + 60 * 60 * 1000);
+  f.scheduler.result(id, { status: 200, manual: true, generationTest: true, quotaGeneration: generation });
+  assert.equal(f.scheduler.state(f.repo.get('upstreams', id)), 'ready');
+  assert.equal(f.repo.get('upstreams', id).cooldown_reason, null);
+});
+
+test('ordinary 400 and rate limit do not become quota errors', t => {
+  const f = fixture(t);
+  const id = f.add({ name: 'normal' });
+  f.scheduler.result(id, { status: 400 });
+  assert.equal(f.repo.get('upstreams', id).cooldown_until, 0);
+  f.scheduler.result(id, { status: 429, retryAfter: '7' });
+  assert.equal(f.repo.get('upstreams', id).cooldown_until, f.now() + 7000);
+  assert.notEqual(f.repo.get('upstreams', id).cooldown_reason, 'insufficient_quota');
+});
