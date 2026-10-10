@@ -51,6 +51,7 @@ export async function startProtocolServer({ apiBase, env = {} } = {}) {
   console.error = (...args) => { logs.push(args.map(String).join(' ')); };
   const routes = new Map([
     ['/v1/chat/completions', protocols.handleChatCompletions],
+    ['/v1/messages', protocols.handleMessages],
     ['/v1/responses', protocols.handleResponses],
   ]);
   const { server, base } = await listen(async (req, res) => {

@@ -8,6 +8,8 @@
 
 **完整功能**：OpenAI Chat Completions / **Responses API（`/v1/responses`）** + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止）| 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
 
+缓存读取量取自上游 `cachedInputTokens`；该字段未提供时读取 `inputTokenDetails.cacheReadTokens`。三个兼容接口的流式与非流式响应采用同一口径，上游明确报告的 0 不会被覆盖；本代理不估算或制造缓存命中。Chat / Responses 输入总量包含缓存，Messages 的 `input_tokens` 不包含缓存部分。
+
 **社区**: [Linux.do](https://linux.do) — 一个友好的中文技术社区。
 
 ## 当前控制台：混合协议入口

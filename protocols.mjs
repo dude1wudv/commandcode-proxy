@@ -775,7 +775,7 @@ function createSseTranslator(model, completionId, created) {
             usage = event.usage;
             this.inputTokens = event.usage.inputTokens ?? 0;
             this.outputTokens = event.usage.outputTokens ?? 0;
-            this.cachedInputTokens = event.usage.cachedInputTokens ?? 0;
+            this.cachedInputTokens = event.usage.cachedInputTokens ?? event.usage.inputTokenDetails?.cacheReadTokens ?? 0;
           }
           break;
         }
@@ -855,6 +855,8 @@ function makeChunk(id, created, model, delta, finishReason, usage) {
 // - outputTokens=0 → zero everything (anti false billing)
 function normalizeUsage(u) {
   if (!u) return;
+  // CC may report cache reads only in token details. Preserve an explicit flat zero.
+  u.cachedInputTokens ??= u.inputTokenDetails?.cacheReadTokens;
   const ot = Number(u.outputTokens);
   if (!ot) {  // 0, null, undefined, NaN → zero input + cached (anti false billing)
     u.inputTokens = 0;
@@ -875,7 +877,7 @@ function anthropicInputTokens(usage, noCacheOverride) {
   if (typeof noCacheOverride === 'number' && noCacheOverride >= 0) return noCacheOverride;
   const noCache = u.inputTokenDetails && u.inputTokenDetails.noCacheTokens;
   if (typeof noCache === 'number' && noCache >= 0) return noCache;
-  const cacheRead = u.cachedInputTokens || (u.inputTokenDetails && u.inputTokenDetails.cacheReadTokens) || 0;
+  const cacheRead = u.cachedInputTokens ?? u.inputTokenDetails?.cacheReadTokens ?? 0;
   const cacheWrite = (u.inputTokenDetails && u.inputTokenDetails.cacheWriteTokens) || 0;
   return Math.max(0, (u.inputTokens || 0) - cacheRead - cacheWrite);
 }
@@ -2111,7 +2113,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
               normalizeUsage(u);
               inputTokens = u.inputTokens ?? inputTokens;
               outputTokens = u.outputTokens ?? outputTokens;
-              cachedInputTokens = u.cachedInputTokens ?? cachedInputTokens;
+              cachedInputTokens = u.cachedInputTokens ?? u.inputTokenDetails?.cacheReadTokens ?? cachedInputTokens;
               cacheWriteTokens = u.inputTokenDetails?.cacheWriteTokens ?? cacheWriteTokens;
               if (typeof u.inputTokenDetails?.noCacheTokens === 'number') {
                 noCacheTokens = u.inputTokenDetails.noCacheTokens;
