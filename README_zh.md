@@ -507,7 +507,7 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 |------|------|
 | **设备指纹** | 每个 Key 首次请求前发送 `POST /alpha/fingerprint/record`；信号值（Windows MachineGuid 形状、真实形状的 MAC、`DESKTOP-xxxxxx` 主机名）由 API key **确定性派生**，并按 CLI 的算法哈希 —— 同一个 key 永远报告同一台设备：重启、内存回收、多实例都一致（用 `CC_FINGERPRINT_SALT` 成批换身份）|
 | **生命周期声明** | Key 初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`，metadata `{sessionId, cliVersion, mode, os}`）|
-| **按 Key 分 Session** | 每个 API Key 独立 session，12h 过期 + 1h 随机抖动 |
+| **内容派生 Session** | 客户端未提供会话标识时，用 API key、模型、system 和开头的 user 文本派生稳定 UUID，同时作为 `x-session-id` 与 `threadId` |
 | **协议版本号** | `x-command-code-version` 报**实际实现的协议版本**（当前 `1.81.0`）；npm 上有新版本只打**漂移告警**，不会静默改版本号 |
 | **CLI 信封格式** | 9 键：`config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
@@ -518,7 +518,7 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 | **API Key 格式验证** | 对 `Authorization: Bearer` 或 `x-api-key` 用正则 `user_[a-zA-Z0-9_-]+` 提取，自动清理多余路径/前缀，`sk-xxx` 等非 `user_` 格式拒 |
 | **流式超时保护** | 流式 30s、非流式 90s → 429 + SDK 自动重试 |
 | **连续超时阈值** | 连续 3 次超时后才提示压缩上下文 |
-| **零输出防护** | outputTokens=0 → 429 `rate_limit_error`（SDK 自动重试，反异常计费） |
+| **零输出防护** | 尚未写出响应头时 outputTokens=0 → 429 `rate_limit_error`；Responses 流若已经发出 `created`，改为 `response.failed`，不再谎报 `completed` |
 | **上游中止** | 客户端断连 + 全部错误路径 `AbortController` 打断 CC |
 | **隐私保护日志** | 日志不含 API Key 片段、错误 body、stack trace |
 
@@ -799,7 +799,7 @@ CC_CLIENT_DRAIN_TIMEOUT_MS=60000 npm start
 
 - **`logFile` 是同步写**（`appendFileSync`），公网负载下会阻塞事件循环 —— 建议保持留空，从 stdout 收集。
 - **systemd 兜底**：配 `MemoryMax=` 与 `NODE_OPTIONS=--max-old-space-size=`，让超限杀掉 proxy 而不是 `sshd`/`nginx`。
-- **多账号 + 多实例**：`sessionStore` / `keyStateStore` 是进程内 `Map`。同一个 API key 打到两个实例会得到两个不同 session 与**两个不同设备指纹**，上游会看到「一个账号在多台机器上」。横向扩展请按 API key 做一致性哈希（`hash $cc_key consistent`），不要轮询。
+- **多账号 + 多实例**：设备指纹按 API key 确定性派生，多个实例看到的是同一台设备。没有客户端会话头时，session 也按请求内容派生，不依赖进程内随机值。`keyStateStore` 只缓存指纹和初始化节流，空闲淘汰不会改变设备身份。
 
 ## 免责声明
 

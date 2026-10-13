@@ -506,7 +506,7 @@ Aligned line-by-line against the official npm package source (`command-code@1.81
 |-----------|---------------|
 | **Device Fingerprint** | `POST /alpha/fingerprint/record` before first request per key; signal values (Windows MachineGuid shape, real-shaped MACs, `DESKTOP-xxxxxx` hostname) are **derived deterministically from the API key** and hashed exactly like the CLI, so one key always reports the same device — across restarts, memory reclamation and multiple instances (bulk reset via `CC_FINGERPRINT_SALT`) |
 | **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`, metadata `{sessionId, cliVersion, mode, os}`) sent in parallel with the fingerprint on key init |
-| **Per-Key Session** | One session per API key, 12h expiry + 1h random jitter |
+| **Content-derived session** | When the client sends no session id, a stable UUID is derived from the API key, model, system prompt and leading user text, and used as both `x-session-id` and `threadId` |
 | **Version** | `x-command-code-version` reports the **protocol version actually implemented** (currently `1.81.0`); newer npm releases only raise a drift **warning**, never a silent version bump |
 | **CLI Envelope** | 9 keys: `config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
@@ -517,7 +517,7 @@ Aligned line-by-line against the official npm package source (`command-code@1.81
 | **Key Validation** | Regex `user_[a-zA-Z0-9_-]+` on `Authorization: Bearer` or `x-api-key`, auto-cleans extra paths/prefixes, rejects `sk-xxx` format |
 | **Stream Timeout** | 30s streaming / 90s non-streaming → 429 with SDK auto-retry |
 | **Consecutive Timeout** | 3 consecutive timeouts before "reduce context" hint |
-| **Zero-Output Guard** | outputTokens=0 → 429 `rate_limit_error` (SDK auto-retry, anti false billing) |
+| **Zero-Output Guard** | outputTokens=0 before response headers → 429 `rate_limit_error`; a Responses stream that already sent `created` ends with `response.failed` instead of a false `completed` |
 | **Upstream Abort** | `AbortController` on client disconnect + all error paths |
 | **Privacy Logging** | No API key fragments, no error bodies, no stack traces in logs |
 
@@ -798,7 +798,7 @@ A more robust cap still belongs at the reverse proxy (`limit_conn`), since only 
 
 - **`logFile` uses `appendFileSync`** — synchronous writes on the event loop. Under public load they serialize the loop; prefer leaving it empty and collecting stdout.
 - **systemd guard rails**: set `MemoryMax=` and `NODE_OPTIONS=--max-old-space-size=` so an overshoot kills the proxy, not `sshd`/`nginx`.
-- **Multi-account + multiple instances**: `sessionStore` / `keyStateStore` are per-process `Map`s, so the same API key served by two instances gets two different sessions and **two different device fingerprints** — upstream sees one account on multiple machines. Scale with consistent hashing on the API key (`hash $cc_key consistent`), not round-robin.
+- **Multi-account + multiple instances**: the device fingerprint is derived from the API key, so every instance reports the same device. Without a client session header, the session id is also derived from the request content rather than a per-process random value. `keyStateStore` only caches the fingerprint and init throttle; idle eviction does not change the device identity.
 
 ## Disclaimer
 

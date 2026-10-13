@@ -67,23 +67,25 @@ function loadConfig() {
 const CFG = loadConfig();
 
 // ── 设备指纹（形态与哈希逐字对齐官方 CLI 1.81.0） ──────
-// CPU 型号与核心数对应表（仅 Windows x64）
+// CPU 型号与核数对应表（仅 Windows x64）。
+// 出网的 components.cpuCount 必须是逻辑处理器数：CLI 的 gatherRawSignals 取 os.cpus().length。
+// cpuModel 与 cpuCount 明文上传，填物理核数等于宣称这台机器关了超线程。
 const FINGERPRINT_CPUS = [
-  { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10 },   // TEMP-REVERT
-  { model: '12th Gen Intel(R) Core(TM) i5-12400F', cores: 6 },
-  { model: '12th Gen Intel(R) Core(TM) i9-12900K', cores: 16 },
-  { model: '13th Gen Intel(R) Core(TM) i7-13700K', cores: 16 },
-  { model: '13th Gen Intel(R) Core(TM) i5-13600K', cores: 14 },
-  { model: '13th Gen Intel(R) Core(TM) i9-13900K', cores: 24 },
-  { model: 'Intel(R) Core(TM) Ultra 7 155H', cores: 16 },
-  { model: 'Intel(R) Core(TM) Ultra 9 285H', cores: 16 },
-  { model: 'Intel(R) Core(TM) i9-14900K', cores: 24 },
-  { model: 'Intel(R) Core(TM) i7-14700K', cores: 20 },
-  { model: 'AMD Ryzen 7 7800X3D', cores: 8 },
-  { model: 'AMD Ryzen 9 7950X', cores: 16 },
-  { model: 'AMD Ryzen 5 7600', cores: 6 },
-  { model: 'AMD Ryzen 9 7900X', cores: 12 },
-  { model: 'AMD Ryzen 7 5800X3D', cores: 8 },
+  { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10, threads: 16 },   // 6P+4E
+  { model: '12th Gen Intel(R) Core(TM) i5-12400F', cores: 6, threads: 12 },
+  { model: '12th Gen Intel(R) Core(TM) i9-12900K', cores: 16, threads: 24 },   // 8P+8E
+  { model: '13th Gen Intel(R) Core(TM) i7-13700K', cores: 16, threads: 24 },   // 8P+8E
+  { model: '13th Gen Intel(R) Core(TM) i5-13600K', cores: 14, threads: 20 },   // 6P+8E
+  { model: '13th Gen Intel(R) Core(TM) i9-13900K', cores: 24, threads: 32 },   // 8P+16E
+  { model: 'Intel(R) Core(TM) Ultra 7 155H', cores: 16, threads: 22 },
+  { model: 'Intel(R) Core(TM) Ultra 9 285H', cores: 16, threads: 16 },   // Arrow Lake 取消超线程
+  { model: 'Intel(R) Core(TM) i9-14900K', cores: 24, threads: 32 },   // 8P+16E
+  { model: 'Intel(R) Core(TM) i7-14700K', cores: 20, threads: 28 },   // 8P+12E
+  { model: 'AMD Ryzen 7 7800X3D', cores: 8, threads: 16 },
+  { model: 'AMD Ryzen 9 7950X', cores: 16, threads: 32 },
+  { model: 'AMD Ryzen 5 7600', cores: 6, threads: 12 },
+  { model: 'AMD Ryzen 9 7900X', cores: 12, threads: 24 },
+  { model: 'AMD Ryzen 7 5800X3D', cores: 8, threads: 16 },
 ];
 const FINGERPRINT_MEMS = [8, 16, 24, 32, 48, 64];
 const FINGERPRINT_TZS = [
@@ -181,7 +183,7 @@ function generateFingerprint(apiKey) {
       arch: DEVICE_PROFILE.arch,
       osRelease: DEVICE_PROFILE.osRelease,
       cpuModel: cpuEntry.model,
-      cpuCount: cpuEntry.cores,
+      cpuCount: cpuEntry.threads,   // 逻辑处理器数，对齐 CLI 的 os.cpus().length
       memGiB,
       isContainer: DEVICE_PROFILE.isContainer,
       timezone: tz,
@@ -342,46 +344,34 @@ function summarizeUpstreamError(text, limit = 500) {
   return flat.length > limit ? flat.slice(0, limit) + '…(' + (flat.length - limit) + ' more)' : flat;
 }
 
-// ── 会话管理 ───────────────────────────────────────
-// 每个 API Key 独立一个 session，12h 过期 + 1h 随机抖动
-// 同一 Key 在同一周期内复用，到期自动换新
-const SESSION_DURATION_MS = 12 * 60 * 60 * 1000;    // 12h
-const SESSION_JITTER_MS  = 60 * 60 * 1000;           // 1h 抖动范围
-
-const sessionStore = new Map(); // apiKey → { sessionId, expiresAt }
-
-function ensureSession(apiKey) {
-  const now = Date.now();
-  const entry = sessionStore.get(apiKey);
-
-  if (entry && now < entry.expiresAt) {
-    return entry.sessionId;
-  }
-
-  // 过期或第一次：生成新 session
-  const jitter = Math.floor(Math.random() * SESSION_JITTER_MS);
-  const sessionId = randomUUID();
-  sessionStore.set(apiKey, { sessionId, expiresAt: now + SESSION_DURATION_MS + jitter });
-      log('info', 'Session created', { sessionId: sessionId.slice(0, 8), storeSize: sessionStore.size });
-  return sessionId;
-}
-
-// 定期清理过期 session 和 key 状态，防止 Map 无限增长
-setInterval(() => {
-  const now = Date.now();
-  let cleaned = 0;
-  for (const [key, entry] of sessionStore) {
-    if (now >= entry.expiresAt) {
-      sessionStore.delete(key);
-      keyStateStore.delete(key); // 同时清理该 key 的指纹状态
-      cleaned++;
+// ── 会话标识 ───────────────────────────────────────
+// 客户端没带会话头时，按请求内容派生稳定 UUID：同一段前缀得到同一个 x-session-id / threadId，
+// 方便上游复用提示缓存。不再按 key 随机换 12h session。
+function deriveSessionId(apiKey, ccBody) {
+  const params = (ccBody && ccBody.params) || {};
+  const h = crypto.createHash('sha1');
+  h.update(apiKey || '').update('\0');
+  h.update(params.model || '').update('\0');
+  if (Array.isArray(params.system)) {
+    for (const b of params.system || []) {
+      if (b && typeof b.text === 'string') h.update(b.text).update('\0');
     }
   }
-  if (cleaned > 0) log('info', 'Session cleanup', { cleaned, remaining: sessionStore.size });
-}, 60 * 60 * 1000).unref();
+  for (const msg of params.messages || []) {
+    if (msg.role !== 'user') break;
+    if (!Array.isArray(msg.content)) continue;
+    for (const p of msg.content) {
+      if (p.type === 'text' && typeof p.text === 'string') h.update(p.text).update('\0');
+    }
+  }
+  const bytes = h.digest().subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 
-function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
-  // 优先从客户端传来的 session 类 header 获取
+function getSessionId(incomingHeaders, apiKey, promptCacheKey, ccBody) {
   const candidates = [
     incomingHeaders['x-session-id'],
     incomingHeaders['x-claude-code-session-id'],
@@ -391,16 +381,19 @@ function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
   for (const id of candidates) {
     if (id && typeof id === 'string' && id.length >= 8) return id;
   }
-  // 按 API Key 分 session
-  return ensureSession(apiKey);
+  return deriveSessionId(apiKey, ccBody);
 }
 
-// 每个请求独立 thread ID
-function newThreadId() { return randomUUID(); }
+// CC 信封的 threadId 只接受合法 UUID。非 UUID 的 session 值不下发，避免上游看到真 CLI 不会产生的 threadId。
+function isWireUuid(v) {
+  return typeof v === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
+}
 
 // ── 每 Key 独立状态（fingerprint + 初始化节流） ──
-// 每个 API Key 拥有自己的设备指纹和初始化定时器
-const keyStateStore = new Map(); // apiKey → { fingerprint, nextInitAt }
+// 指纹由 apiKey 确定性派生，这个 Map 只是缓存。按空闲淘汰，避免重置活跃 key 的 nextInitAt。
+const KEY_STATE_IDLE_MS = 24 * 60 * 60 * 1000;
+const keyStateStore = new Map(); // apiKey → { fingerprint, nextInitAt, lastSeen }
 
 function getOrCreateKeyState(apiKey) {
   let state = keyStateStore.get(apiKey);
@@ -408,12 +401,23 @@ function getOrCreateKeyState(apiKey) {
     state = {
       fingerprint: generateFingerprint(apiKey),
       nextInitAt: 0,
+      lastSeen: 0,
     };
     keyStateStore.set(apiKey, state);
-    log('info', 'Fingerprint generated for key', { keyPrefix: apiKey.slice(0, 8) });
+    log('info', 'Fingerprint derived for key', { keyPrefix: apiKey.slice(0, 8) });
   }
+  state.lastSeen = Date.now();
   return state;
 }
+
+setInterval(() => {
+  const now = Date.now();
+  let evicted = 0;
+  for (const [key, state] of keyStateStore) {
+    if (now - state.lastSeen > KEY_STATE_IDLE_MS) { keyStateStore.delete(key); evicted++; }
+  }
+  if (evicted > 0) log('info', 'Key state evicted (idle)', { evicted, remaining: keyStateStore.size });
+}, 60 * 60 * 1000).unref();
 
 // ── 初始化预请求（fingerprint + lifecycle，首次 + 每 8h+2h 抖动） ────
 const INIT_REFRESH_MS = 8 * 60 * 60 * 1000;    // 8h
@@ -431,6 +435,9 @@ async function ensureInitialized(apiKey, signal) {
     // 并行发两个预请求
     const headers = {
       'Content-Type': 'application/json',
+      // 指纹预请求与生成请求共用 CLI 的 User-Agent: cli。预请求若走 Node 默认 UA，
+      // 同一账号会表现为两种客户端。
+      'User-Agent': 'cli',
       'x-cli-environment': 'production',
       'Authorization': `Bearer ${apiKey}`,
       'x-command-code-version': CC_VERSION,
@@ -672,19 +679,21 @@ function buildCcRequest(openaiReq) {
     body.params.reasoning_effort = reasoning_effort;
   }
   // CLI 总是下发 tools（没有工具时是空数组）—— 空数组与缺键在 wire 上可观测，这里对齐
-  // CLI 的 toWireTools：只有 name / description / input_schema，没有 type 字段
+  // CLI 的 toWireTools：只有 name / description / input_schema，没有 type 字段。
+  // 名字原样透传：反代没有 CLI 的退役工具目录，重写会导致声明名和消息名不一致。
   body.params.tools = (tools || []).map(t => ({
-      name: toWireToolName(t.function?.name || t.name || ''),
+      name: t.function?.name || t.name || '',
       description: t.function?.description || t.description || '',
       input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
     }));
   if (tool_choice !== undefined) {
-    // OpenAI 格式 → CC (Anthropic 风格) 格式
-    if (typeof tool_choice === 'string') {
-      const map = { 'auto': 'auto', 'none': 'none', 'required': 'any' };
+    if (tool_choice === 'none' || (typeof tool_choice === 'object' && tool_choice?.type === 'none')) {
+      // CC 的 tool_choice 只有 auto / any / tool。none 会被 400 拒绝，语义上是本轮禁用工具。
+      body.params.tools = [];
+    } else if (typeof tool_choice === 'string') {
+      const map = { 'auto': 'auto', 'required': 'any' };
       body.params.tool_choice = { type: map[tool_choice] || 'auto' };
     } else if (tool_choice.type === 'function') {
-      // OpenAI object → Anthropic object
       body.params.tool_choice = { type: 'tool', name: tool_choice.function?.name };
     } else {
       body.params.tool_choice = tool_choice;
@@ -696,15 +705,6 @@ function buildCcRequest(openaiReq) {
 
   return body;
 }
-
-// CLI 发送前会重写部分工具名（resolveToolNameAlias / ow 表）
-const TOOL_NAME_ALIASES = {
-  bash_output: 'shell_output',
-  task_output: 'shell_output',
-  tool_search: 'search_tools',
-  read_multiple_files: 'read_file',
-};
-function toWireToolName(name) { return TOOL_NAME_ALIASES[name] || name; }
 
 // CLI 的 toWireToolOutput：只取文本块，用 '\n' 拼接
 function toWireToolOutputValue(content) {
@@ -727,6 +727,7 @@ function createSseTranslator(model, completionId, created) {
   let chunkIndex = 0;
   let sentRole = false;
   let finishReason = null;
+  let unsupportedFinishReason = null;
   let usage = null;
   let toolCallIndex = 0;
   let capturedCacheWrite;
@@ -824,7 +825,12 @@ function createSseTranslator(model, completionId, created) {
             total_tokens: (u.inputTokens ?? 0) + (u.outputTokens ?? 0),
             prompt_tokens_details: { cached_tokens: u.cachedInputTokens ?? 0 },
           } : undefined;
-          out.push(makeChunk(completionId, created, model, {}, fr, openaiUsage));
+          if (OPENAI_FINISH_REASONS.has(fr)) {
+            out.push(makeChunk(completionId, created, model, {}, fr, openaiUsage));
+          } else {
+            // 上游连接失败族不能写进 SSE finish_reason，严格客户端会整条流反序列化失败。
+            unsupportedFinishReason = fr;
+          }
           break;
         }
 
@@ -859,7 +865,12 @@ function createSseTranslator(model, completionId, created) {
 
     /** 这次上游流若没有正常走完 finish，返回可读原因；正常则为 null。 */
     incompleteDetail() {
-      return incompleteUpstreamDetail(sawFinish, finishReason);
+      const standard = incompleteUpstreamDetail(sawFinish, finishReason);
+      if (standard) return standard;
+      if (!unsupportedFinishReason) return null;
+      return unsupportedFinishReason === 'upstream_error'
+        ? 'provider reported an upstream connection failure'
+        : `provider reported an unsupported finish reason (${unsupportedFinishReason})`;
     },
 
     /** 获取 SSE 结束标记 */
@@ -936,18 +947,19 @@ function anthropicInputTokens(usage, noCacheOverride) {
 //   tool_use | tool-calls | tool_calls                    → tool_calls
 //   length | max_tokens | max_output_tokens
 //          | model_context_window_exceeded                → length
-//   /^(network|connection|upstream)[-_\s]?error$/i        → upstream_error
+//   error | /^(network|connection|upstream)[-_\s]?error$/i → upstream_error
 //   pause_turn                                            → pause_turn（原样保留）
 // 关键点：'length' 家族**不止 'length' 一个值**。max_output_tokens 与
 // model_context_window_exceeded 都是「输出被截断」，折成 stop/end_turn 等于
-// 把半截回答谎报成完整回答。未知值一律原样返回，宁可让它露出来也不要静默折成 stop。
+// 把半截回答谎报成完整回答。未知值先留在内部词汇表，出口由 toOpenAIFinishReason 处理。
+// 裸 'error' 是 provider 空响应，不是可透出的业务值，必须并进 upstream_error。
 function mapFinishReason(reason) {
   const r = String(reason ?? '').trim().toLowerCase();
   if (!r) return 'stop';
   if (r === 'tool-calls' || r === 'tool_calls' || r === 'tool_use') return 'tool_calls';
   if (r === 'length' || r === 'max_tokens'
       || r === 'max_output_tokens' || r === 'model_context_window_exceeded') return 'length';
-  if (/^(?:network|connection|upstream)[-_\s]?error$/.test(r)) return 'upstream_error';
+  if (r === 'error' || /^(?:network|connection|upstream)[-_\s]?error$/.test(r)) return 'upstream_error';
   return r;
 }
 
@@ -1083,8 +1095,19 @@ function readBody(req) {
         settled = true;
         chunks.length = 0;
         const mb = Math.round(MAX_BODY_SIZE / 1024 / 1024);
-        const err = new Error(`Request body exceeds ${mb}MB limit`);
+        const declared = Number.parseInt(req.headers['content-length'] ?? '', 10);
+        const known = Number.isFinite(declared) && declared > 0;
+        const bytes = known ? declared : totalSize;
+        const sizeNote = ` (body is ${(bytes / 1048576).toFixed(1)}MB${known ? '' : '+'})`;
+        log('warn', 'Request body rejected (too large)', {
+          path: req.url,
+          limitMB: mb,
+          bodyMB: +(bytes / 1048576).toFixed(1),
+          exact: known,
+        });
+        const err = new Error(`Request body exceeds ${mb}MB limit${sizeNote}`);
         err.statusCode = 413;
+        err.bodyBytes = bytes;
         reject(err);
         return;
       }
@@ -1197,10 +1220,10 @@ function upstreamProxyLabel() { return proxyLabel(UPSTREAM_PROXY); }
 
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
   const traceparent = generateTraceparent();
-  const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey);
+  const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey, body);
   // CLI 的 toWireThreadId：只有合法 UUID 才放进信封，否则整个键省略。
   // 同时按 CLI 的键顺序重排：config, memory, taste, skills, permissionMode, threadId, mode, params
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(sessionId))) {
+  if (isWireUuid(sessionId)) {
     const ordered = {};
     for (const k of ['config', 'memory', 'taste', 'skills', 'permissionMode']) ordered[k] = body[k];
     ordered.threadId = sessionId;
@@ -1270,6 +1293,8 @@ async function handleChatCompletions(req, res) {
 
   // 构建 CC 请求体
   const ccBody = buildCcRequest(openaiReq);
+  const promptCacheKey = openaiReq.prompt_cache_key;
+  openaiReq = null;
 
   // AbortController 用于客户端断连时真正打断 CC 上游（pi-commandcode-provider 模式）
   // 每次尝试都换一个新的（已 abort 的 signal 不可复用）
@@ -1303,6 +1328,42 @@ async function handleChatCompletions(req, res) {
     await sleep(UPSTREAM_RETRY_BASE_MS * attempt);
   };
 
+  // 断连监听必须挂在重试循环之前，并且只注册一次。放进「第一次已经拿到响应头」
+  // 的分支时，第一次尝试若在响应头之前闪断，之后的尝试就再也没有断连监听。
+  res.on('close', () => {
+    if (res.writableEnded) return;
+    aborted = true;
+    const reason = lastCcEvent?.startsWith('tool-input') ? 'tool-input-silent-timeout'
+      : lastCcEvent?.includes('delta') ? 'streaming-active-disconnect'
+      : 'client-hangup';
+    abortController.signal.aborted || log('warn', 'Client disconnected', {
+      path: '/v1/chat/completions',
+      model, completionId, reason,
+      streaming: stream,
+      elapsedMs: Date.now() - startTime,
+      bytesSent: bytesReceived,
+      lastCcEvent: lastCcEvent || '(none)',
+      keepaliveCount,
+      inputTokens: translator?.inputTokens ?? 0,
+      outputTokens: translator?.outputTokens ?? 0,
+      cachedInputTokens: translator?.cachedInputTokens ?? 0,
+    });
+    if (!abortController.signal.aborted) {
+      try {
+        res.write(`data: ${JSON.stringify({
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, prompt_tokens_details: { cached_tokens: 0 } },
+        })}\n\n`);
+        res.write('data: [DONE]\n\n');
+      } catch {}
+      try { abortController.abort(); } catch {}
+    }
+  });
+
   // 上游闪断重试循环：只在「传输层闪断」且「尚未向下游写出任何字节」时
   // 才再来一遍；正常路径第一轮即 break。循环体沿用原有缩进、未做重排，只为把 diff 控到最小。
   attemptLoop: for (attempt = 1; attempt <= UPSTREAM_RETRY_MAX + 1; attempt++) {
@@ -1322,7 +1383,7 @@ async function handleChatCompletions(req, res) {
     // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
     // 转发到 CC API（传入客户端 headers，用于提取 session ID）
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key);
+    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
@@ -1331,42 +1392,6 @@ async function handleChatCompletions(req, res) {
       sendJSON(res, mapped.status, mapped.body);
       return;
     }
-
-    // 下游断连检测：打断 CC 上游 + 记录日志（只在首次尝试注册，重试不重复挂载监听器）
-    if (attempt === 1) res.on('close', () => {
-      if (res.writableEnded) return; // Normal completion, not a disconnect
-      aborted = true;
-      const reason = lastCcEvent?.startsWith('tool-input') ? 'tool-input-silent-timeout'
-        : lastCcEvent?.includes('delta') ? 'streaming-active-disconnect'
-        : 'client-hangup';
-      abortController.signal.aborted || log('warn', 'Client disconnected', {
-        path: '/v1/chat/completions',
-        model, completionId, reason,
-        streaming: stream,
-        elapsedMs: Date.now() - startTime,
-        bytesSent: bytesReceived,
-        lastCcEvent: lastCcEvent || '(none)',
-        keepaliveCount,
-        inputTokens: translator?.inputTokens ?? 0,
-        outputTokens: translator?.outputTokens ?? 0,
-        cachedInputTokens: translator?.cachedInputTokens ?? 0,
-      });
-      if (!abortController.signal.aborted) {
-        // 断连前抢发 usage=0 终止 chunk，避免下游自行估算 token
-        try {
-          res.write(`data: ${JSON.stringify({
-            id: completionId,
-            object: 'chat.completion.chunk',
-            created,
-            model,
-            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, prompt_tokens_details: { cached_tokens: 0 } },
-          })}\n\n`);
-          res.write('data: [DONE]\n\n');
-        } catch {}
-        try { abortController.abort(); } catch {}
-      }
-    });
 
     if (stream) {
       // ── 流式响应 ──
@@ -1784,8 +1809,14 @@ function mapAnthropicStopReason(finishReason) {
 // OpenAI 的 finish_reason 只有 stop | length | tool_calls | content_filter | function_call。
 // pause_turn 没有对应值：折成 'stop' 是谎报完成（正是要修的问题），
 // 折成 'length' 至少如实表达了「输出不完整」，下游的截断处理会做对的事。
+const OPENAI_FINISH_REASONS = new Set(['stop', 'length', 'tool_calls', 'content_filter', 'function_call']);
+
 function toOpenAIFinishReason(finishReason) {
-  return finishReason === 'pause_turn' ? 'length' : finishReason;
+  if (finishReason === 'pause_turn') return 'length';
+  if (finishReason === 'upstream_error') return finishReason;
+  if (OPENAI_FINISH_REASONS.has(finishReason)) return finishReason;
+  log('warn', 'Unrecognized upstream finish reason', { reason: String(finishReason), mappedTo: 'stop' });
+  return 'stop';
 }
 
 // Generate a Claude-format fake signature for thinking blocks.
@@ -2294,18 +2325,42 @@ async function handleMessages(req, res) {
   const model = anthropicReq.model || 'claude-sonnet-4-6';
 
   // Convert Anthropic → OpenAI → CC
-  const openaiReq = convertAnthropicToOpenAI(anthropicReq);
+  let openaiReq = convertAnthropicToOpenAI(anthropicReq);
   const ccBody = buildCcRequest(openaiReq);
+  openaiReq = null;
+  anthropicReq = null;
 
   let abortController = new AbortController();
   let aborted = false;
-  let closeBound = false;
   let attempt = 0;
   // 提前初始化，断连回调/超时 catch 安全引用（避免块级作用域 ReferenceError）
   const startTime = Date.now();
   let messageId = '';
   let reader = null;
   let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
+
+  res.on('close', () => {
+    if (res.writableEnded) return;
+    aborted = true;
+    if (!abortController.signal.aborted) {
+      try {
+        res.write(`event: message_delta\ndata: ${JSON.stringify({
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn' },
+          usage: { output_tokens: 0, input_tokens: 0, cache_read_input_tokens: 0 },
+        })}\n\n`);
+        res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+      } catch {}
+      try { abortController.abort(); } catch {}
+    }
+    log('warn', 'Client disconnected', {
+      path: '/v1/messages',
+      model,
+      messageId,
+      streaming: stream,
+      elapsedMs: Date.now() - startTime,
+    });
+  });
 
   attemptLoop: for (attempt = 1; attempt <= UPSTREAM_RETRY_MAX + 1; attempt++) {
   if (attempt > 1 && aborted) {
@@ -2325,33 +2380,6 @@ async function handleMessages(req, res) {
       log('error', 'CC API error (Anthropic)', { status: ccResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
       sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message, mapped.body.retry_after);
       return;
-    }
-
-    // 下游断连检测：打断 CC 上游 + 记录日志
-    if (!closeBound) { closeBound = true;
-    res.on('close', () => {
-      if (res.writableEnded) return; // Normal completion, not a disconnect
-      aborted = true;
-      if (!abortController.signal.aborted) {
-        // 断连前抢发 usage=0 终止事件，避免下游自行估算 token
-        try {
-          res.write(`event: message_delta\ndata: ${JSON.stringify({
-            type: 'message_delta',
-            delta: { stop_reason: 'end_turn' },
-            usage: { output_tokens: 0, input_tokens: 0, cache_read_input_tokens: 0 },
-          })}\n\n`);
-          res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
-        } catch {}
-        try { abortController.abort(); } catch {}
-      }
-      log('warn', 'Client disconnected', {
-        path: '/v1/messages',
-        model,
-        messageId,
-        streaming: stream,
-        elapsedMs: Date.now() - startTime,
-      });
-    });
     }
 
     if (stream) {
@@ -2677,6 +2705,19 @@ function responsesTextOf(content) {
   return content.map(p => (p && typeof p === 'object' ? (p.text || '') : '')).join('');
 }
 
+function isResponsesImagePart(part) {
+  return !!part && typeof part === 'object' && (part.type === 'input_image' || part.image_url !== undefined);
+}
+
+function responsesImagePartsOf(parts) {
+  if (!Array.isArray(parts)) return [];
+  return parts.filter(isResponsesImagePart).map(part => {
+    const raw = part.image_url !== undefined ? part.image_url : part.input_image;
+    const url = typeof raw === 'string' ? raw : (raw && raw.url) || '';
+    return url ? { type: 'image_url', image_url: { url } } : null;
+  }).filter(Boolean);
+}
+
 // data URL 图片：一段文本里超过这个长度的 data URL 就当成"图"，提出来单独发；小图留在文本里
 const INLINE_IMAGE_MIN = 256 * 1024;
 // 单张 data URL 上限：再大就不要了，只留一句占位说明（既撑爆上游窗口，也撑爆内存）
@@ -2794,6 +2835,19 @@ function convertResponsesToChat(respReq) {
   // Responses 把 reasoning / message / function_call 拆成并列 item，
   // Chat 要求它们挂在同一条 assistant 消息上，故先累积再冲刷。
   let pending = null;
+  // 并行 tool_call 的图片必须放在全部 tool_result 之后。插在中间会打断 tool_use / tool_result 配对。
+  let pendingToolImages = [];
+  const flushToolImages = () => {
+    if (!pendingToolImages.length) return;
+    messages.push({
+      role: 'user',
+      content: [
+        { type: 'text', text: '[images returned by tool calls]' },
+        ...pendingToolImages,
+      ],
+    });
+    pendingToolImages = [];
+  };
   const ensurePending = () => (pending = pending || { role: 'assistant', content: null, tool_calls: [] });
   const flushPending = () => {
     if (!pending) return;
@@ -2810,13 +2864,15 @@ function convertResponsesToChat(respReq) {
   } else if (Array.isArray(input)) {
     for (const item of input) {
       if (!item || typeof item !== 'object') continue;
+      const itemType = item.type ?? (item.role ? 'message' : undefined);
+      if (itemType !== 'function_call_output') flushToolImages();
       // OpenAI 规范里 input 数组的联合类型第一个成员是 EasyInputMessage，它的
       // required 只有 role 与 content —— type 是可选的（官方文档与 SDK 示例普遍写作
       // { role: 'user', content: 'hi' }）。item.type 为 undefined 但有 role 时按
       // message 处理，否则这类 item 会落进 default 被丢弃：全部省略时只剩
       // "input is required" 的误导性报错；混合形态时更糟 —— 校验能过，用户在
       // HTTP 200 下静默丢消息。这里只在 type 缺失时兜底，带 type 的 item 判定不变。
-      switch (item.type ?? (item.role ? 'message' : undefined)) {
+      switch (itemType) {
         case 'reasoning': {
           const t = responsesReasoningOf(item);
           if (t) ensurePending().reasoning_content = t;
@@ -2824,11 +2880,18 @@ function convertResponsesToChat(respReq) {
         }
         case 'message': {
           const text = responsesTextOf(item.content);
+          const images = responsesImagePartsOf(item.content);
           if (item.role === 'assistant') {
             if (text) ensurePending().content = text;
           } else if (item.role === 'system' || item.role === 'developer') {
             flushPending();
             messages.push({ role: 'system', content: text });
+          } else if (images.length) {
+            flushPending();
+            messages.push({
+              role: 'user',
+              content: [...(text ? [{ type: 'text', text }] : []), ...images],
+            });
           } else {
             flushPending();
             messages.push({ role: 'user', content: text });
@@ -2853,17 +2916,12 @@ function convertResponsesToChat(respReq) {
           const { text, images } = splitToolOutput(item.output);
           messages.push({ role: 'tool', tool_call_id: item.call_id || '', content: text });
           if (images.length) {
-            log('info', 'Hoisted tool-output images to user message', {
+            log('info', 'Deferred tool-output images (batched after tool results)', {
               count: images.length, bytes: images.reduce((a, u) => a + u.length, 0),
             });
-            // content 走 image_url 形态，交给 buildCcRequest 里已验证的 user 图片分支转成 CC 的 {type:'image',image,mimeType}
-            messages.push({
-              role: 'user',
-              content: [
-                { type: 'text', text: '[image returned by tool call]' },
-                ...images.map(url => ({ type: 'image_url', image_url: { url }, _toolImage: true })),
-              ],
-            });
+            pendingToolImages.push(
+              ...images.map(url => ({ type: 'image_url', image_url: { url }, _toolImage: true })),
+            );
           }
           break;
         }
@@ -2875,6 +2933,7 @@ function convertResponsesToChat(respReq) {
     }
   }
   flushPending();
+  flushToolImages();
 
   // 统一裁剪工具截图（此时所有 item 都已转成 chat 形态，按顺序处理最直观）
   trimToolImages(messages);
@@ -3083,6 +3142,8 @@ function createResponsesSseTranslator(model, responseId, created) {
     // 这期间一个字节都不出网就会被中间层（实测 EdgeOne 源站 ~15s）或客户端首字节超时掐掉
     start: startResponse,
     get started() { return createdSent; },
+    // created/in_progress 会在收到 200 时先行发出，started 不能再当作「有没有内容」。
+    get hasOutput() { return outputIndex > 0 || doneItems.length > 0; },
     get stopReason() { return finishReason; },
     parseLine(line) {
       const trimmed = line.trim();
@@ -3266,6 +3327,7 @@ async function handleResponses(req, res) {
   const ccBody = buildCcRequest(chatReq);
   const promptCacheKey = chatReq.prompt_cache_key;
   chatReq = null;
+  respReq = null;
 
   let abortController = new AbortController();
   let aborted = false;
@@ -3379,10 +3441,17 @@ async function handleResponses(req, res) {
             }
             const failed = translator.fail(translator.upstreamError.body.error.message);
             if (failed.length) await writeEvents(failed);
-          } else if (translator.outputTokens === 0 && !translator.started) {
+          } else if (translator.outputTokens === 0 && !translator.hasOutput) {
             try { if (!abortController.signal.aborted) abortController.abort(); } catch (e2) {}
-            sendResponsesError(res, 429, 'rate_limit_error',
-              'Empty response from upstream (zero output tokens)', 10);
+            if (!started) {
+              sendResponsesError(res, 429, 'rate_limit_error',
+                'Empty response from upstream (zero output tokens)', 10);
+              return;
+            }
+            // 响应头已经按 200 发出，不能再改成 429。空响应也不能走 finish() 谎报 completed。
+            const failed = translator.fail('Empty response from upstream (zero output tokens)');
+            if (failed.length) await writeEvents(failed);
+            if (!res.writableEnded) res.end();
             return;
           } else {
             if (!started) { res.writeHead(200, SSE_HEADERS); started = true; }
