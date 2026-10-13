@@ -9,8 +9,8 @@ FROM node:24-alpine
 ARG GIT_SHA=dev
 ENV CC_GIT_SHA=$GIT_SHA
 WORKDIR /app
+COPY package.json protocols.mjs server.mjs ./
 COPY scripts/ ./scripts/
-COPY protocols.mjs server.mjs ./
 COPY lib/ ./lib/
 COPY --from=frontend /build/frontend/dist ./frontend/dist
 RUN mkdir -p /data && chown -R node:node /app /data
