@@ -56,7 +56,7 @@ const mockHandler = async (req, res) => {
   }
 
   if ((path === '/alpha/fingerprint/record' || path === '/alpha/lifecycle-events') && req.method === 'POST') {
-    state.initRequests.push({ path, authorization, body: await requestBody(req) });
+    state.initRequests.push({ path, authorization, headers: req.headers, body: await requestBody(req) });
     mockResponse(res, 200, { ok: true });
     return;
   }
@@ -65,7 +65,7 @@ const mockHandler = async (req, res) => {
     const body = await requestBody(req);
     const model = body?.params?.model;
     const configured = state.generateByModel.get(model) || { status: 200, events: successEvents };
-    state.generateRequests.push({ authorization, body, model, configured });
+    state.generateRequests.push({ authorization, headers: req.headers, body, model, configured });
     if (configured.status !== 200) {
       mockResponse(res, configured.status, configured.body || '<401> provider rejected credential', configured.headers || (configured.status === 429 ? { 'retry-after': '7' } : {}));
       return;
@@ -488,6 +488,9 @@ test('messages, responses, and chat completions all stream and buffer converted 
     protocol.checkStream(streamed.text);
     assert.equal(state.generateRequests.length, beforeStream + 1);
     assert.equal(state.generateRequests.at(-1).body.params.model, 'alpha-model');
+    assert.equal(state.generateRequests.at(-1).headers['x-command-code-version'], '1.81.0');
+    assert.equal(state.generateRequests.at(-1).headers['user-agent'], 'cli');
+    assert.equal(state.generateRequests.at(-1).headers['x-cli-surface'], undefined);
     protocol.checkRequest(state.generateRequests.at(-1).body);
 
     const beforePlain = state.generateRequests.length;
@@ -503,7 +506,58 @@ test('messages, responses, and chat completions all stream and buffer converted 
   }
   assert.ok(state.initRequests.some(item => item.path === '/alpha/fingerprint/record'));
   assert.ok(state.initRequests.some(item => item.path === '/alpha/lifecycle-events'));
-  assert.equal(state.initRequests.filter(item => item.authorization === `Bearer ${GOOD_CREDENTIAL}`).length, 2);
+  const initForAccount = state.initRequests.filter(item => item.authorization === `Bearer ${GOOD_CREDENTIAL}`);
+  assert.equal(initForAccount.length, 2);
+  for (const item of initForAccount) assert.equal(item.headers['x-command-code-version'], '1.81.0');
+  const lifecycle = initForAccount.find(item => item.path === '/alpha/lifecycle-events');
+  assert.equal(lifecycle.body.metadata.cliVersion, '1.81.0');
+});
+
+test('cache-write-tokens fills a zero finish write and leaves a reported write unchanged', async () => {
+  const previous = state.generateByModel.get('alpha-model');
+  const baseUsage = { inputTokens: 100, outputTokens: 2, cachedInputTokens: 10, inputTokenDetails: { cacheReadTokens: 10, cacheWriteTokens: 0, noCacheTokens: 50 } };
+  state.generateByModel.set('alpha-model', { status: 200, events: [
+    { type: 'text-delta', text: 'ok' },
+    { type: 'cache-write-tokens', cacheWriteTokens: -1 },
+    { type: 'finish', finishReason: 'stop', totalUsage: baseUsage },
+    { type: 'cache-write-tokens', cacheWriteTokens: 40 },
+  ] });
+  try {
+    const messages = await inferenceCall('/v1/messages', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${clientKey}` },
+      body: { model: 'alpha-model', max_tokens: 32, messages: [{ role: 'user', content: 'hello' }] },
+    });
+    assert.equal(messages.status, 200);
+    assert.equal(messages.body.usage.cache_creation_input_tokens, 40);
+    assert.equal(messages.body.usage.cache_read_input_tokens, 10);
+    assert.equal(messages.body.usage.input_tokens, 50);
+
+    const streamed = await inferenceCall('/v1/messages', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${clientKey}` },
+      body: { model: 'alpha-model', max_tokens: 32, messages: [{ role: 'user', content: 'hello' }], stream: true },
+    });
+    assert.equal(streamed.status, 200);
+    const delta = sseEvents(streamed.text).find(item => item.event === 'message_delta');
+    assert.equal(delta.data.usage.cache_creation_input_tokens, 40);
+
+    state.generateByModel.set('alpha-model', { status: 200, events: [
+      { type: 'text-delta', text: 'ok' },
+      { type: 'cache-write-tokens', cacheWriteTokens: 40 },
+      { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 100, outputTokens: 2, inputTokenDetails: { cacheWriteTokens: 7, noCacheTokens: 93 } } },
+    ] });
+    const kept = await inferenceCall('/v1/responses', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${clientKey}` },
+      body: { model: 'alpha-model', input: 'hello' },
+    });
+    assert.equal(kept.status, 200);
+    assert.equal(kept.body.usage.input_tokens_details.cache_write_tokens, 7);
+  } finally {
+    if (previous) state.generateByModel.set('alpha-model', previous);
+    else state.generateByModel.delete('alpha-model');
+  }
 });
 
 test('inference and management routes stay isolated; 401 is isolated and 429 is not replayed', async () => {

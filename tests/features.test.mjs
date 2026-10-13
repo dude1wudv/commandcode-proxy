@@ -49,7 +49,7 @@ test('alerts summarize credential, balance, proxy and key usage without storing 
   const items = buildAlerts({
     accounts: [{ id: 'up-1', name: '主账号', health: 'credential_error', cooldown_until: 0, proxy_label: 'socks5://proxy.example:1080', proxy_probe: { success: false, message: '超时', checked_at: 1 }, billing: { monthly_remaining: 1 } }],
     clients: [{ id: 'key-1', name: '出口', enabled: true, expires_at: Date.now() + 86_400_000, daily_token_limit: 100 }],
-    protocol: { drifted: true, latest: '9.9.9', implemented: '1.53.1' },
+    protocol: { drifted: true, latest: '9.9.9', implemented: '1.81.0' },
     balanceUsd: 5,
     quota: { usage: id => new UsageLog(repo).usage(id) },
   });

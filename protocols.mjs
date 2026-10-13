@@ -66,7 +66,7 @@ function loadConfig() {
 
 const CFG = loadConfig();
 
-// ── 设备指纹（形态与哈希逐字对齐官方 CLI 1.53.1） ──────
+// ── 设备指纹（形态与哈希逐字对齐官方 CLI 1.81.0） ──────
 // CPU 型号与核心数对应表（仅 Windows x64）
 const FINGERPRINT_CPUS = [
   { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10 },   // TEMP-REVERT
@@ -191,11 +191,11 @@ function generateFingerprint(apiKey) {
   };
 }
 
-// 本代理**实际实现**的 wire 协议版本（对齐 command-code@1.53.1 源码）。
+// 本代理**实际实现**的 wire 协议版本（对齐 command-code@1.81.0 源码）。
 // 真机发的永远是「形状 + 版本号」自洽的组合；如果版本号跟着 npm 走而形状没变，
 // 就变成「自称最新版、却说旧方言」—— 这比版本号过期更容易被行为分析挑出来。
 // 因此这里报的是协议版本，npm 上更新了只告警、不自动改。
-const CC_PROTOCOL_VERSION = '1.53.1';
+const CC_PROTOCOL_VERSION = '1.81.0';
 let CC_VERSION = CC_PROTOCOL_VERSION;
 const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — 检查一次是否发生漂移
 const protocolDrift = { checked_at: null, implemented: CC_PROTOCOL_VERSION, latest: null, drifted: false, error: null };
@@ -248,8 +248,9 @@ const MAX_BODY_SIZE = (() => {
 })();
 // 上游读空闲超时（issue #19）：只计「reader.read() 的等待」，每收到一个 chunk 重置，
 // 不是整个请求的总时长。默认值保持不变（30s / 90s），可用环境变量覆盖 ——
-// 官方 CLI 对上游没有任何 idle timeout（反编译 command-code@1.50.0 已验证，
-// createApiClient 调用点均未传 timeout），合法的长思考停顿可达数百秒，
+// 官方 CLI 的 /alpha/generate 仍然不传 idle timeout（对照 command-code@1.81.0，
+// createApiClient({ baseUrl }) 不带 timeout；只有 sandbox transport 传了 300s，本代理不走那条路径），
+// 合法的长思考停顿可达数百秒，
 // 遇到推理模型被 30s 误杀 / 触发 429 重试放大时，调大这两个值即可。
 const STREAM_IDLE_TIMEOUT_MS = (() => {
   const ms = Number.parseInt(process.env.CC_STREAM_IDLE_MS ?? '', 10);
@@ -513,7 +514,7 @@ function buildCcRequest(openaiReq) {
   // 提取系统提示：OpenAI 的 system / developer 都映射为系统提示。
   // 形态对齐 CLI 的 toWireSystem —— **块数组**，非最后一块补 \n，cache_control 逐块保留。
   // （CLI 的 composeSystemPrompt：基础提示词是字符串时发字符串、是 sections 时发块数组；
-  //   真机验证两种形态服务端都接受，见 PROTOCOL-FACTS-1.53.1.md。这里统一用块数组，
+  //   对照 command-code@1.81.0，两种形态都还在。这里统一用块数组，
   //   才能把客户端标在 system 上的缓存断点原样送上去。）
   const systemMsgs = messages.filter(m => m.role === 'system' || m.role === 'developer');
   const systemBlocks = [];
@@ -728,6 +729,7 @@ function createSseTranslator(model, completionId, created) {
   let finishReason = null;
   let usage = null;
   let toolCallIndex = 0;
+  let capturedCacheWrite;
 
   return {
     lastCcEvent: '',
@@ -802,10 +804,16 @@ function createSseTranslator(model, completionId, created) {
           break;
         }
 
+        case 'cache-write-tokens': {
+          const captured = capturedCacheWriteTokens(event);
+          if (captured !== undefined) capturedCacheWrite = captured;
+          break;
+        }
+
         case 'finish': {
           sawFinish = true;
           const fr = toOpenAIFinishReason(finishReason || mapFinishReason(event.finishReason || 'stop'));
-          const u = event.totalUsage || usage || {};
+          const u = applyCapturedCacheWrite(event.totalUsage || usage || {}, capturedCacheWrite);
           normalizeUsage(u);
           this.inputTokens = u.inputTokens ?? 0;
           this.outputTokens = u.outputTokens ?? 0;
@@ -873,6 +881,19 @@ function makeChunk(id, created, model, delta, finishReason, usage) {
   return `data: ${JSON.stringify(chunk)}\n\n`;
 }
 
+// command-code@1.81.0 consumeStream：`cache-write-tokens` 事件带 cacheWriteTokens。
+// finish.totalUsage 里的 cacheWriteTokens 已经非 0 时不覆盖；为 0 或缺失时才用事件值。
+function capturedCacheWriteTokens(event) {
+  const n = event?.cacheWriteTokens;
+  return typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+function applyCapturedCacheWrite(usage, captured) {
+  if (captured === undefined || !usage || typeof usage !== 'object') return usage;
+  const current = usage.inputTokenDetails?.cacheWriteTokens ?? 0;
+  if (current !== 0) return usage;
+  return { ...usage, inputTokenDetails: { ...(usage.inputTokenDetails || {}), cacheWriteTokens: captured } };
+}
+
 // normalize CC usage stats:
 // - outputTokens=0 → zero everything (anti false billing)
 function normalizeUsage(u) {
@@ -911,7 +932,7 @@ function anthropicInputTokens(usage, noCacheOverride) {
 }
 
 // 上游 finishReason → 本代理内部规范化取值。
-// 对齐 CLI 的 normalizeStopReason2 / isNetworkFailureFinish（command-code@1.54.0）：
+// 对齐 CLI 的 normalizeStopReason2 / isNetworkFailureFinish（command-code@1.81.0）：
 //   tool_use | tool-calls | tool_calls                    → tool_calls
 //   length | max_tokens | max_output_tokens
 //          | model_context_window_exceeded                → length
@@ -1534,6 +1555,7 @@ async function handleChatCompletions(req, res) {
       let sawFinish = false;
       let usage = null;
       let toolCalls = null;
+      let capturedCacheWrite;
 
       reader = ccResponse.body.getReader();
       const decoder = new TextDecoder();
@@ -1562,6 +1584,11 @@ async function handleChatCompletions(req, res) {
                   },
                 });
                 break;
+              case 'cache-write-tokens': {
+                const captured = capturedCacheWriteTokens(event);
+                if (captured !== undefined) capturedCacheWrite = captured;
+                break;
+              }
               case 'finish-step':
               case 'finish':
                 lastCcEvent = event.type;
@@ -1660,6 +1687,7 @@ async function handleChatCompletions(req, res) {
           finish_reason: toOpenAIFinishReason(finishReason),
         }],
     usage: (() => {
+      usage = applyCapturedCacheWrite(usage, capturedCacheWrite);
       if (!usage) usage = {};
       normalizeUsage(usage);
       return {
@@ -1993,6 +2021,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
   let outputTokens = 0;
   let cachedInputTokens = 0;
   let cacheWriteTokens = 0;
+  let capturedCacheWrite;
   let noCacheTokens = -1;   // -1 = 上游未提供该字段，改用减法兜底
   let stopReason = null;
   // 归一化后的 finishReason（mapAnthropicStopReason 之前的值），用于判定「是否正常结束」
@@ -2128,6 +2157,12 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
             break;
           }
 
+          case 'cache-write-tokens': {
+            const captured = capturedCacheWriteTokens(event);
+            if (captured !== undefined) capturedCacheWrite = captured;
+            break;
+          }
+
           case 'finish-step':
           case 'finish': {
             // 上游的 finishReason 是 'tool-calls'（连字符），必须先过 mapFinishReason 规范化成
@@ -2178,6 +2213,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
     // 无论上游是否回报 usage，都把本地计数同步进 ctx（零输出判定与超时日志依赖它）。
     // 注意：ctx.inputTokens 保存的是上游原始总数，仅供日志排查；
     // message_delta 的 input_tokens 走 anthropicInputTokens / noCacheTokens 换算，不读它。
+    if (!cacheWriteTokens && capturedCacheWrite !== undefined) cacheWriteTokens = capturedCacheWrite;
     ctx.inputTokens = inputTokens;
     ctx.outputTokens = outputTokens;
     ctx.cachedInputTokens = cachedInputTokens;
@@ -2468,6 +2504,7 @@ async function handleMessages(req, res) {
       let toolCalls = null;
       let thinkingText = ''; // CC reasoning → Anthropic thinking block
       let upstreamError = null;
+      let capturedCacheWrite;
 
       reader = ccResponse.body.getReader();
       const decoder = new TextDecoder();
@@ -2502,6 +2539,11 @@ async function handleMessages(req, res) {
                 finishReason = mapFinishReason(event.finishReason || 'stop');
                 if (event.totalUsage || event.usage) usage = event.totalUsage || event.usage;
                 break;
+              case 'cache-write-tokens': {
+                const captured = capturedCacheWriteTokens(event);
+                if (captured !== undefined) capturedCacheWrite = captured;
+                break;
+              }
               case 'error':
                 lastCcEvent = event.type;
                 upstreamError = mapCcEventError(event);
@@ -2577,6 +2619,7 @@ async function handleMessages(req, res) {
       }
 
       consecutiveTimeouts = 0;
+      usage = applyCapturedCacheWrite(usage, capturedCacheWrite);
       sendJSON(res, 200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText));
     }
     if (attempt > 1) noteRetryRecovered({ path: '/v1/messages', model, attempt });
@@ -2806,7 +2849,7 @@ function convertResponsesToChat(respReq) {
           // 绝不能 JSON.stringify 成文本送上游：base64 会按文本分词，真机实测单张 2.76MB 截图 ≈ 1.92M token，
           // 直接撞穿模型 1M 窗口（"maximum context length is 1048576 tokens ... 1922800 in the messages"）。
           // 官方 CLI 的排布是：tool-result 只放文本，图片提出来放进紧跟其后的一条 user 消息
-          // （见 command-code@1.66.0 dist/cli.mjs 的 convertUserMessage / tool_result 分支）。
+          // （对照 command-code@1.81.0 dist/cli.mjs 的 toWireMessages / toWireToolOutput：tool-result 仍只有文本）。
           const { text, images } = splitToolOutput(item.output);
           messages.push({ role: 'tool', tool_call_id: item.call_id || '', content: text });
           if (images.length) {
@@ -2961,6 +3004,7 @@ function createResponsesSseTranslator(model, responseId, created) {
   let outputIndex = 0;
   const doneItems = [];
   let usage = null;
+  let capturedCacheWrite;
   let textAcc = '';
   let finishReason = null;
   // 是否见过完成信号（见 incompleteUpstreamDetail 的口径说明）
@@ -3093,6 +3137,12 @@ function createResponsesSseTranslator(model, responseId, created) {
           break;
         }
 
+        case 'cache-write-tokens': {
+          const captured = capturedCacheWriteTokens(event);
+          if (captured !== undefined) capturedCacheWrite = captured;
+          break;
+        }
+
         case 'finish': {
           sawFinish = true;
           // 必须归一化：截断类不止 'length'（还有 max_output_tokens /
@@ -3152,7 +3202,7 @@ function createResponsesSseTranslator(model, responseId, created) {
           output_text: textAcc,
           incomplete_details: truncated ? { reason: 'max_output_tokens' }
             : paused ? { reason: 'pause_turn' } : null,
-          usage: buildResponsesUsage(usage, this.outputTokens),
+          usage: buildResponsesUsage(applyCapturedCacheWrite(usage, capturedCacheWrite), this.outputTokens),
         }),
       }));
       return out;
@@ -3379,6 +3429,7 @@ async function handleResponses(req, res) {
       let fullText = '';
       let thinkingText = '';
       let usage = null;
+      let capturedCacheWrite;
       let finishReason = 'stop';
       let sawFinish = false;
       let upstreamError = null;
@@ -3417,6 +3468,11 @@ async function handleResponses(req, res) {
               finishReason = mapFinishReason(event.finishReason || 'stop');
               if (event.totalUsage || event.usage) usage = event.totalUsage || event.usage;
               break;
+            case 'cache-write-tokens': {
+              const captured = capturedCacheWriteTokens(event);
+              if (captured !== undefined) capturedCacheWrite = captured;
+              break;
+            }
             case 'error':
               lastCcEvent = event.type;
               upstreamError = mapCcEventError(event);
@@ -3493,6 +3549,7 @@ async function handleResponses(req, res) {
 
       consecutiveTimeouts = 0;
       echoOpts.finishReason = finishReason;
+      usage = applyCapturedCacheWrite(usage, capturedCacheWrite);
       sendJSON(res, 200, buildResponsesObject(
         responseId, model, created, fullText, thinkingText, toolCalls, usage, echoOpts));
     }

@@ -4,7 +4,7 @@
 // 单张 2.76MB 截图 ≈ 1.92M token，直接撞穿模型的 1M 窗口：
 //   400 This model's maximum context length is 1048576 tokens. However, you requested 1986800 tokens
 //       (1922800 in the messages, 64000 in the completion)
-// 官方 CLI 的排布（command-code@1.66.0 dist/cli.mjs 的 convertUserMessage / tool_result 分支）：
+// 官方 CLI 的排布（对照 command-code@1.81.0 dist/cli.mjs 的 toWireMessages / toWireToolOutput）：
 //   tool-result 只放文本，图片提出来放进**紧跟其后**的一条 user 消息，
 //   线格为 { type:'image', image:'data:<mime>;base64,…', mimeType:'<mime>' }。
 import { test } from 'node:test';

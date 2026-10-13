@@ -27,7 +27,7 @@ test('parseCredits accepts zero, numeric strings, unknown/null values, and clamp
 
 test('monthlyWindow maps official plans, normalizes prefixes, and rejects unknown or unsafe grants', () => {
   const end = 1_800_000_000_000;
-  for (const [plan, limit] of [['individual-go', 10], ['individual-goat', 70], ['individual-pro', 30], ['individual-pro-v1', 80], ['individual-provider', 15], ['individual-max', 150], ['individual-ultra', 300], ['teams-pro', 40]]) {
+  for (const [plan, limit] of [['individual-go', 10], ['individual-go-v1', 10], ['individual-goat', 70], ['individual-pro', 30], ['individual-pro-v1', 80], ['individual-provider', 15], ['individual-max', 150], ['individual-ultra', 300], ['teams-pro', 40]]) {
     assert.deepEqual(monthlyWindow({ success: true, data: { status: 'active', planId: plan, currentPeriodEnd: end } }, 0), { used: limit, limit, remaining: 0, resets_at: end });
   }
   assert.equal(monthlyWindow({ success: true, data: { status: 'active', planId: 'individual_pro_v1_extra', currentPeriodEnd: end } }, 12.5).limit, 80);

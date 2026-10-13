@@ -10,7 +10,7 @@ const api = vi.hoisted(() => vi.fn(async (path: string, method = 'GET') => {
   if (path === '/clients') return { data: [{ id: 'client-1', name: '编辑器', notes: '', enabled: true, whitelist: [], expires_at: null, key_prefix: 'sk-cc_ab…', requests: 1, successes: 1, errors: 0, last_used_at: null, group_id: 'default' }] };
   if (path === '/groups') return { data: [{ id: 'default', name: '默认分组', notes: '' }] };
   if (path === '/alerts') return { data: [] };
-  if (path === '/health/details') return { version: '1.0.0', git_sha: 'abc', started_at: 1, uptime_ms: 1000, inflight: 0, database: 'ok', accounts: {}, protocol: { implemented: '1.53.1', latest: '1.53.1', drifted: false, error: null } };
+  if (path === '/health/details') return { version: '1.0.0', git_sha: 'abc', started_at: 1, uptime_ms: 1000, inflight: 0, database: 'ok', accounts: {}, protocol: { implemented: '1.81.0', latest: '1.81.0', drifted: false, error: null } };
   if (path === '/clients' && method === 'POST') return { id: 'client-2', name: '新出口', key: 'sk-cc_once.secret' };
   if (method === 'DELETE') return { ok: true };
   return { data: [] };

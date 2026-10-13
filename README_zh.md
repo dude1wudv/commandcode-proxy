@@ -4,7 +4,7 @@
 
 带多账号管理控制台的 Command Code 反代代理，提供 OpenAI / Anthropic 兼容接口。
 
-逐条对齐官方 npm 包源码（`command-code@1.53.1`；`dist/cli.mjs` 只是压缩、**没有混淆**）。上游 npm 走到更高版本时代理只打**漂移告警**，不会静默改版本号（见[反检测](#反检测)）。
+逐条对齐官方 npm 包源码（`command-code@1.81.0`；`dist/cli.mjs` 只是压缩、**没有混淆**）。上游 npm 走到更高版本时代理只打**漂移告警**，不会静默改版本号（见[反检测](#反检测)）。
 
 **完整功能**：OpenAI Chat Completions / **Responses API（`/v1/responses`）** + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止）| 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
 
@@ -508,10 +508,10 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 | **设备指纹** | 每个 Key 首次请求前发送 `POST /alpha/fingerprint/record`；信号值（Windows MachineGuid 形状、真实形状的 MAC、`DESKTOP-xxxxxx` 主机名）由 API key **确定性派生**，并按 CLI 的算法哈希 —— 同一个 key 永远报告同一台设备：重启、内存回收、多实例都一致（用 `CC_FINGERPRINT_SALT` 成批换身份）|
 | **生命周期声明** | Key 初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`，metadata `{sessionId, cliVersion, mode, os}`）|
 | **按 Key 分 Session** | 每个 API Key 独立 session，12h 过期 + 1h 随机抖动 |
-| **协议版本号** | `x-command-code-version` 报**实际实现的协议版本**（当前 `1.53.1`）；npm 上有新版本只打**漂移告警**，不会静默改版本号 |
+| **协议版本号** | `x-command-code-version` 报**实际实现的协议版本**（当前 `1.81.0`）；npm 上有新版本只打**漂移告警**，不会静默改版本号 |
 | **CLI 信封格式** | 9 键：`config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
-| **环境标识** | `x-cli-environment: production`、`x-taste-learning: "false"`、`User-Agent: cli` |
+| **环境标识** | `x-cli-environment: production`、`x-taste-learning: "false"`、`User-Agent: cli`。交互式 CLI 不发 `x-cli-surface`（1.81.0 只在 `cmd acp` 和 `cmd rpc` 时设置） |
 | **Project Slug** | `x-project-slug` = `slugify(DEVICE_PROFILE.projectDir)`，与 `config.workingDir` 同源（默认 `C:\Users\dev\projects\app`，用 `CC_DEVICE_PROJECT_DIR` 改）|
 | **设备档案单一真源** | 指纹 / `config.environment` / `config.workingDir` / `x-project-slug` / lifecycle 的 `os` 共用同一份 `DEVICE_PROFILE`（`win32` / `x64`）—— 既不会自相矛盾（"指纹说 win32、环境说 linux"），也不把宿主真实平台、Node 版本、cwd 交给上游 |
 | **思考强度** | `reasoning_effort` 透传 (low/medium/high/max) |
@@ -655,7 +655,7 @@ CC_MAX_INFLIGHT=32 npm start    # 最多同时处理 32 个请求
 只要上游在持续吐流就不会触发，哪怕单个请求已经跑了几十分钟。
 
 **默认值与官方 CLI 不一致，这是已知取舍**（[#19](https://github.com/MAXeaglet/commandcode-proxy/issues/19)）：
-官方 CLI 对上游**没有任何** idle timeout —— 反编译 `command-code@1.50.0` 可见所有 `createApiClient({ baseUrl })` 调用点都未传 `timeout`，实测 700+ 秒的停顿可正常完成。
+官方 CLI 的 `/alpha/generate` **仍然不传** idle timeout —— 对照 `command-code@1.81.0`，`createApiClient({ baseUrl })` 不带 `timeout`（只有 sandbox transport 传了 300 秒，本代理不走那条路径），实测 700+ 秒的停顿可正常完成。
 本代理保留 30s 是为了兜住真正死掉的连接；代价是**推理模型的长思考停顿可能被误杀**。
 
 若遇到「`429 Response timeout`」「`zero output tokens`」且日志里 `elapsedMs ≈ 30000`、`bytesReceived = 0`，
