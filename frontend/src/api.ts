@@ -26,7 +26,20 @@ export interface Client {
   id: string; name: string; notes: string; enabled: boolean; whitelist: string[];
   expires_at: number | null; key_prefix: string; requests: number; successes: number;
   errors: number; last_used_at: number | null; key?: string;
+  rpm_limit?: number | null; max_concurrency?: number | null; daily_token_limit?: number | null; monthly_token_limit?: number | null;
+  day_tokens?: number; month_tokens?: number;
 }
+export interface AlertItem { id: string; severity: 'warning' | 'critical'; kind: string; page: string; target: string; title: string; message: string }
+export interface RequestLog {
+  id: number; ts: number; request_id: string; client_id: string; upstream_id: string | null; group_id: string | null;
+  model: string; endpoint: string; stream: number; status: number; error_code: string | null; duration_ms: number;
+  ttfb_ms: number | null; input_tokens: number; output_tokens: number; cached_tokens: number; retries: number;
+}
+export interface UsageSummary {
+  from: number; to: number; group_by: string; requests: number; successes: number; input_tokens: number;
+  output_tokens: number; cached_tokens: number; cache_rate: number; rows: { key: string; requests: number; tokens: number; cached_tokens: number; input_tokens?: number }[];
+}
+export interface HealthDetails { version: string; git_sha: string; started_at: number; uptime_ms: number; inflight: number; database: string; accounts: Record<string, number>; protocol: { implemented: string; latest: string | null; drifted: boolean; error: string | null } }
 export interface Audit { id: number; time: number; action: string; target: string; outcome: string; ip: string }
 export interface Overview {
   accounts: number; healthy: number; models: number; clients: number; inflight: number;
@@ -65,7 +78,7 @@ export async function testStream(id: string, body: { model: string; prompt: stri
     method: 'POST', credentials: 'same-origin', cache: 'no-store', signal,
     headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf }, body: JSON.stringify(body),
   });
-  if (!response.ok) { const data = await response.json(); if (response.status === 401) window.dispatchEvent(new Event('cc:unauthorized')); throw new ApiError(response.status, data.error?.message || '测试失败'); }
+  if (!response.ok) { const data = await readJson(response); if (response.status === 401) window.dispatchEvent(new Event('cc:unauthorized')); throw new ApiError(response.status, data.error?.message || '测试失败', data.error?.code); }
   if (!response.body) throw new Error('浏览器不支持流式响应');
   const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ''; let completed = false;
   try {
@@ -76,7 +89,10 @@ export async function testStream(id: string, body: { model: string; prompt: stri
         const block = buffer.slice(0, index); buffer = buffer.slice(index + 2);
         const event = block.split('\n').find(line => line.startsWith('event:'))?.slice(6).trim();
         const data = block.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trim()).join('\n');
-        if (event && data) { onEvent(event, JSON.parse(data)); if (event === 'done') completed = true; }
+        if (event && data) {
+          try { onEvent(event, JSON.parse(data)); if (event === 'done') completed = true; }
+          catch { onEvent('error', { message: '测试事件无法解析，已跳过' }); }
+        }
       }
     }
     if (!completed) throw new Error('测试连接意外中断，请重试');

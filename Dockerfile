@@ -6,6 +6,8 @@ COPY frontend/ ./
 RUN npx --no-install vite build
 
 FROM node:24-alpine
+ARG GIT_SHA=dev
+ENV CC_GIT_SHA=$GIT_SHA
 WORKDIR /app
 COPY scripts/ ./scripts/
 COPY protocols.mjs server.mjs ./

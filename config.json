@@ -1,4 +1,5 @@
 {
+  "_note": "控制台模式的监听端口、管理地址和请求体上限由环境变量决定。port、host、apiKey、projectSlug、logLevel、useProviderModels 在 server.mjs 控制台模式下不控制监听或鉴权；apiBase、zdr、upstreamProxy、logFile 仍由 protocols.mjs 读取。",
   "port": 3050,
   "host": "0.0.0.0",
   "apiKey": "",

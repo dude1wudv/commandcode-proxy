@@ -9,7 +9,9 @@ describe('console appearance', () => {
     initAppearance();
     const appearance = useAppearance();
     expect(appearance.isDark.value).toBe(true);
-    appearance.toggleAppearance();
+    appearance.cycleAppearance();
+    expect(localStorage.getItem('commandcode-appearance')).toBe('system');
+    appearance.cycleAppearance();
     expect(localStorage.getItem('commandcode-appearance')).toBe('light');
     initAppearance();
     expect(appearance.isDark.value).toBe(false);
@@ -21,7 +23,7 @@ describe('console appearance', () => {
     vi.stubGlobal('matchMedia', () => ({ matches: true }));
     initAppearance();
     expect(useAppearance().isDark.value).toBe(true);
-    expect(() => useAppearance().toggleAppearance()).not.toThrow();
+    expect(() => useAppearance().cycleAppearance()).not.toThrow();
     expect(document.documentElement.dataset.appearance).toBe('light');
   });
 });

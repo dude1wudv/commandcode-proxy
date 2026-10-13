@@ -12,6 +12,21 @@
 
 **社区**: [Linux.do](https://linux.do) — 一个友好的中文技术社区。
 
+## 当前控制台
+
+`server.mjs` 同时启动两个监听：
+
+| 服务 | 默认 | 环境变量 | 说明 |
+|---|---|---|---|
+| 管理控制台 | `127.0.0.1:3050` | `PORT` / `HOST` | `/command/` 静态页与 `/command/api/`；Docker 健康检查打这里 |
+| 推理 | `127.0.0.1:3051` | `INFERENCE_PORT` / `HOST` | 客户端使用控制台签发的 `sk-cc_` 出口 key，不能拿上游 `user_` 凭据直接调用 |
+
+Compose 用 `MANAGEMENT_PORT` / `INFERENCE_PORT` 映射主机端口，默认仍只绑 `127.0.0.1`。容器内 `HOST=0.0.0.0`。`CC_MAX_INFLIGHT` 默认 **4**，`CC_MAX_BODY_MB` 默认 **8**。内网入口展示地址用 `CC_INTERNAL_BASE_URL`，默认 `http://172.18.0.1:13050/v1`。
+
+上游账号和出口 key 都绑定分组。出口 key 只能调度同组账号；空组不会借用其他组。可选限额：`rpm_limit`、`max_concurrency`、`daily_token_limit`、`monthly_token_limit`，留空表示不限制。token 限额在请求开始前检查，单次请求可能略微超出。请求日志只保存模型、状态、耗时和 token，默认保留 `CC_REQUEST_LOG_DAYS`（30）天。
+
+控制台模式下 `config.json` 的 `port`、`host`、`apiKey`、`projectSlug`、`logLevel`、`useProviderModels` 不决定监听或客户端鉴权。`apiBase`、`zdr`、`upstreamProxy`、`logFile` 仍由协议层读取。日志级别用 `CC_LOG_LEVEL`。`CC_GIT_SHA` 出现在管理端健康详情；`CC_METRICS=1` 时 `/command/metrics` 需要管理员会话或 `CC_METRICS_TOKEN`。
+
 ## 当前控制台：混合协议入口
 
 推理服务独立监听 3051，管理服务监听 3050。客户端使用控制台签发的 API key；上游 `user_` 凭据由服务端按账号解密注入，不能拿上游 key 直接替代客户端 key。
@@ -27,7 +42,24 @@
 
 原生 Responses 保留图片、工具数组、工具参数增量、加密推理及官方 usage；始终发送 `store:false`，拒绝服务端历史续接、后台任务和远程 MCP。客户端应发送完整历史并自行执行 MCP 工具。流缺少终态或含失败事件不会计为成功，`Retry-After` 原样传递；无自动重放。管理端生成测试默认 Chat，可选择原生 Responses。
 
-下文涉及单文件、直传 `user_`、3050 推理及 CLI 指纹的配置是旧独立代理行为参考；当前控制台以 `server.mjs`、管理页和上述双入口为准。
+下文「上游独立模式参考」涉及单文件、直传 `user_`、3050 推理及 CLI 指纹，只描述上游仓库的旧独立代理，不是当前控制台的操作说明。当前控制台以 `server.mjs`、管理页和上述双入口为准。
+
+## 文件结构
+
+```
+commandcode-proxy/
+├── server.mjs            # 管理 3050 / 推理 3051
+├── protocols.mjs         # 上游协议兼容层（合并上游时尽量少改）
+├── lib/                  # 控制台、调度、账单、用量、限额
+├── frontend/             # Vue 控制台；dist 随仓库提交，镜像内重新构建
+├── config.json           # 协议层配置；控制台监听不读 port/host
+├── Dockerfile            # node:24-alpine，两阶段构建前端
+└── docker-compose.yml    # MANAGEMENT_PORT / INFERENCE_PORT
+```
+
+## 上游独立模式参考
+
+以下快速开始、`proxy.mjs` 文件树和部分默认值来自上游单文件代理。控制台部署不要按「把 `user_` 打到 3050」操作。
 
 
 ## 快速开始
@@ -54,7 +86,7 @@ commandcode/
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
 ├── proxy.mjs             # 单文件核心代理（~1900 行）
-├── Dockerfile            # 容器构建文件（node:22-alpine）
+├── Dockerfile            # 上游文档中的 node:22-alpine；当前控制台镜像是 node:24-alpine
 ├── docker-compose.yml    # 容器编排
 ├── .dockerignore         # 构建上下文排除规则
 ├── .github/
@@ -672,8 +704,7 @@ CC_UPSTREAM_RETRY_MAX=0 npm start        # 关闭重试，行为退回改动前
 CC_UPSTREAM_RETRY_BASE_MS=800 npm start  # 退避拉长（默认 400ms）
 ```
 
-> **覆盖范围**：目前 `/v1/chat/completions` 的流式与非流式两条路径都接了重试循环；
-> `/v1/messages` 与 `/v1/responses` 结构不同，未在本次改动中覆盖（闪断仍按原样报错）。
+> **覆盖范围**：`/v1/chat/completions`、`/v1/messages` 和 CLI 版 `/v1/responses` 都在未向下游写出字节时重试。Responses 流式会先发送 `response.created`，因此只有连接在写出响应头之前失败才会重试。官方原生 `/provider/v1/responses` 不重放。
 
 ## 内存与部署
 

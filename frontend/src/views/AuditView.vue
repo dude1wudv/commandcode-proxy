@@ -1,0 +1,10 @@
+<script setup lang="ts">
+import { ArrowDownToLine, FileClock } from 'lucide-vue-next';
+import { useConsole } from '../composables/useConsole';
+import { dateText } from '../utils/format';
+const workspace = useConsole();
+const actionLabels: Record<string, string> = { 'upstreams.billing.authorize': '配置用量授权', 'upstreams.billing.revoke': '移除用量授权', 'auth.login': '管理员登录', 'auth.logout': '退出登录', 'auth.password': '修改密码', 'auth.revoke_others': '撤销其他会话', 'upstreams.create': '新建上游', 'upstreams.update': '修改上游', 'upstreams.delete': '删除上游', 'upstreams.models': '刷新模型目录', 'upstreams.test': '账号生成测试', 'upstreams.proxy.check': '检测代理出口', 'clients.create': '创建出口 key', 'clients.update': '修改出口 key', 'clients.delete': '撤销出口 key', 'clients.rotate': '轮换出口密钥', 'groups.create': '新建分组', 'groups.update': '修改分组', 'groups.delete': '删除分组' };
+</script>
+<template>
+  <div class="info-strip"><FileClock :size="18" /><span>仅记录操作类型、目标 ID、结果与来源 IP。不记录密码、完整密钥、提示词或响应正文。</span></div><section class="panel table-panel"><div class="table-scroll"><table><thead><tr><th scope="col">时间</th><th scope="col">操作</th><th scope="col">目标</th><th scope="col">来源 IP</th><th scope="col">结果</th></tr></thead><tbody><tr v-for="row in workspace.audits" :key="row.id"><td class="small nowrap">{{ dateText(row.time) }}</td><td><span class="audit-action"><FileClock :size="15" />{{ actionLabels[row.action] || row.action }}</span></td><td><code class="target-id">{{ row.target || '管理员会话' }}</code></td><td class="mono small">{{ row.ip || '—' }}</td><td><span :class="['pill', row.outcome === 'success' ? 'ready' : 'cooling']">{{ row.outcome === 'success' ? '成功' : '失败' }}</span></td></tr></tbody></table></div><div v-if="workspace.loaded && !workspace.audits.length" class="empty-state"><FileClock :size="32" /><h3>暂无审计记录</h3></div><footer v-else class="table-footer"><span>已显示 {{ workspace.audits.length }} 条</span><button class="text-button" :disabled="workspace.busy === 'audit'" @click="workspace.moreAudits">加载更早记录 <ArrowDownToLine :size="15" /></button></footer></section>
+</template>

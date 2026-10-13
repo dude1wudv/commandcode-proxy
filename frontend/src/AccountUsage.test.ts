@@ -10,9 +10,9 @@ const billing = { monthly: { used: 7.5, limit: 10, remaining: 2.5, resets_at: 1_
 afterEach(() => { mocks.api.mockReset(); vi.useRealTimers(); });
 
 describe('AccountUsage', () => {
-  it('automatically refreshes on first view and has no Cookie form or legacy cookie display', async () => {
+  it('does not refresh on first view and has no Cookie form or legacy cookie display', async () => {
     mocks.api.mockResolvedValue({}); const wrapper = mount(AccountUsage, { props: { account: account({ billing_source: 'cookie', billing: { monthly_remaining: 99 } }) as never } }); await flushPromises();
-    expect(mocks.api).toHaveBeenCalledWith('/upstreams/account-1/billing/refresh', 'POST', {}); expect(wrapper.find('input').exists()).toBe(false); expect(wrapper.find('form').exists()).toBe(false); expect(wrapper.text()).not.toContain('Cookie'); wrapper.unmount();
+    expect(mocks.api).not.toHaveBeenCalled(); expect(wrapper.find('input').exists()).toBe(false); expect(wrapper.find('form').exists()).toBe(false); expect(wrapper.text()).not.toContain('Cookie'); wrapper.unmount();
   });
 
   it('renders official spend basis, zero/free balances, windows, and reset information', () => {
@@ -35,10 +35,9 @@ describe('AccountUsage', () => {
     expect(wrapper.text()).toContain('刷新失败'); expect(wrapper.emitted('updated')).toBeTruthy(); wrapper.unmount();
   });
 
-  it('refreshes after two hours while visible and reacts to visibility changes', async () => {
-    vi.useFakeTimers(); mocks.api.mockResolvedValue({}); const wrapper = mount(AccountUsage, { props: { account: account({ billing_source: 'upstream', billing_checked_at: Date.now() }) as never } }); await flushPromises(); expect(mocks.api).not.toHaveBeenCalled();
-    vi.advanceTimersByTime(300_001); await flushPromises(); expect(mocks.api).not.toHaveBeenCalled();
-    vi.advanceTimersByTime(7_200_000); await flushPromises(); expect(mocks.api).toHaveBeenCalledTimes(1);
-    const beforeVisibility = mocks.api.mock.calls.length; vi.setSystemTime(Date.now() + 7_200_001); Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' }); document.dispatchEvent(new Event('visibilitychange')); await flushPromises(); expect(mocks.api.mock.calls.length).toBeGreaterThan(beforeVisibility); wrapper.unmount();
+  it('leaves scheduled billing refresh to the server and keeps manual refresh', async () => {
+    vi.useFakeTimers(); mocks.api.mockResolvedValue({}); const wrapper = mount(AccountUsage, { props: { account: account({ billing_source: 'upstream', billing_checked_at: Date.now() }) as never } }); await flushPromises();
+    vi.advanceTimersByTime(7_200_000); await flushPromises(); expect(mocks.api).not.toHaveBeenCalled();
+    await wrapper.find('button').trigger('click'); await flushPromises(); expect(mocks.api).toHaveBeenCalledTimes(1); wrapper.unmount();
   });
 });

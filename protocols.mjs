@@ -198,6 +198,8 @@ function generateFingerprint(apiKey) {
 const CC_PROTOCOL_VERSION = '1.53.1';
 let CC_VERSION = CC_PROTOCOL_VERSION;
 const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — 检查一次是否发生漂移
+const protocolDrift = { checked_at: null, implemented: CC_PROTOCOL_VERSION, latest: null, drifted: false, error: null };
+export function protocolStatus() { return { ...protocolDrift }; }
 
 // ── 协议漂移检测（只告警，不改版本号） ─────────────
 // 上游 CLI 更新可能带来协议变化。这里只负责提醒「该重新读包对齐了」，
@@ -209,7 +211,11 @@ async function checkProtocolDrift() {
     if (!res.ok) throw new Error(`npm responded with ${res.status}`);
     const pkg = await res.json();
     const latest = typeof pkg?.version === 'string' ? pkg.version : null;
-    if (latest && latest !== CC_PROTOCOL_VERSION) {
+    protocolDrift.checked_at = Date.now();
+    protocolDrift.latest = latest;
+    protocolDrift.drifted = Boolean(latest && latest !== CC_PROTOCOL_VERSION);
+    protocolDrift.error = null;
+    if (protocolDrift.drifted) {
       log('warn', 'CC CLI version drift: protocol may have changed, re-align from the npm package', {
         implemented: CC_PROTOCOL_VERSION, latest,
       });
@@ -217,6 +223,8 @@ async function checkProtocolDrift() {
       log('info', 'CC CLI version in sync', { version: latest });
     }
   } catch (e) {
+    protocolDrift.checked_at = Date.now();
+    protocolDrift.error = 'check_failed';
     log('warn', 'CC version check failed', { error: e.message });
   }
 }
@@ -280,6 +288,17 @@ function isRetryableUpstreamError(e) {
 // 仅用于日志：rewinds = 实际重试次数，recovered = 重试后成功交付的次数
 const upstreamRetryStats = { rewinds: 0, recovered: 0 };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+async function rewindUpstream(message, fields) {
+  upstreamRetryStats.rewinds++;
+  const context = requestContext.getStore();
+  if (context) context.retries = (context.retries || 0) + 1;
+  log('warn', message, { maxAttempts: UPSTREAM_RETRY_MAX + 1, ...fields });
+  await sleep(UPSTREAM_RETRY_BASE_MS * (fields.attempt || 1));
+}
+function noteRetryRecovered(fields) {
+  upstreamRetryStats.recovered++;
+  log('info', 'Upstream retry recovered', fields);
+}
 
 // 客户端「僵死」保护：既不读也不断开时，该请求会连带上游连接一直挂着（背压修复后的残留）。
 // 实测残留在途成本约 5MB/连接 —— 有界、不泄漏、断开即回收，但连接数本身无上限。
@@ -297,14 +316,17 @@ const TIMEOUT_REDUCE_CONTEXT_THRESHOLD = 3;
 
 // ── 日志 ─────────────────────────────────────────────
 function log(level, msg, data) {
+  const ranks = { debug: 10, info: 20, warn: 30, error: 40 };
+  if ((ranks[level] || 20) < (ranks[String(process.env.CC_LOG_LEVEL || CFG.logLevel || 'info').toLowerCase()] || 20)) return;
   const context = requestContext.getStore();
   if (context && (level === 'error' || /idle timeout/i.test(msg)) && !(context.status >= 400)) context.status = 502;
-  const allowText = new Set(['body', 'code', 'type', 'implemented', 'latest', 'version', 'error', 'message']);
+  const allowText = new Set(['body', 'code', 'type', 'implemented', 'latest', 'version', 'error', 'message', 'path', 'reason', 'requestId']);
   const metrics = {};
   for (const [key, value] of Object.entries(data || {})) {
     if (typeof value === 'number' || typeof value === 'boolean') metrics[key] = value;
     else if (typeof value === 'string' && allowText.has(key)) metrics[key] = value.replace(/user_[a-zA-Z0-9_-]+/g, 'user_[redacted]');
   }
+  if (context?.requestId) metrics.requestId = context.requestId;
   const line = `[${new Date().toISOString()}] [${level}] ${msg} ${JSON.stringify(metrics)}`;
   console.log(line);
   if (CFG.logFile) { try { appendFileSync(CFG.logFile, line + '\n', 'utf-8'); } catch {} }
@@ -862,6 +884,12 @@ function normalizeUsage(u) {
     u.inputTokens = 0;
     u.cachedInputTokens = 0;
   }
+  const context = requestContext.getStore();
+  if (!context) return;
+  const input = Number(u.inputTokens);
+  const output = Number(u.outputTokens);
+  const cached = Number(u.cachedInputTokens ?? 0);
+  context.usage = { input_tokens: Number.isFinite(input) ? input : 0, output_tokens: Number.isFinite(output) ? output : 0, cached_tokens: Number.isFinite(cached) ? cached : 0 };
 }
 
 // CC 的 inputTokens 是「总数」（含缓存命中部分），而 Anthropic 的 input_tokens 只计
@@ -1241,6 +1269,8 @@ async function handleChatCompletions(req, res) {
     try { reader?.cancel().catch(() => {}); } catch {}
     try { abortController.abort(); } catch {}
     upstreamRetryStats.rewinds++;
+    const stored = requestContext.getStore();
+    if (stored) stored.retries = (stored.retries || 0) + 1;
     log('warn', message, {
       path: '/v1/chat/completions',
       model,
@@ -2163,6 +2193,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
       // 对齐 CLI：这一族一律按可重试错误处理。
       const incomplete = incompleteUpstreamDetail(sawFinish, finishNorm);
       if (incomplete) {
+        ctx.incomplete = incomplete;
         log('warn', 'Upstream stream incomplete', { path: '/v1/messages', reason: incomplete });
         yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: incompleteUpstreamError(incomplete).body.error })}\n\n`;
       // 输出 token 为 0 时记为错误，避免下游异常计费
@@ -2230,14 +2261,23 @@ async function handleMessages(req, res) {
   const openaiReq = convertAnthropicToOpenAI(anthropicReq);
   const ccBody = buildCcRequest(openaiReq);
 
-  const abortController = new AbortController();
+  let abortController = new AbortController();
   let aborted = false;
+  let closeBound = false;
+  let attempt = 0;
   // 提前初始化，断连回调/超时 catch 安全引用（避免块级作用域 ReferenceError）
   const startTime = Date.now();
   let messageId = '';
   let reader = null;
   let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
 
+  attemptLoop: for (attempt = 1; attempt <= UPSTREAM_RETRY_MAX + 1; attempt++) {
+  if (attempt > 1 && aborted) {
+    log('info', 'Upstream retry abandoned (client disconnected during backoff)', { path: '/v1/messages', model, attempt });
+    return;
+  }
+  abortController = new AbortController();
+  bytesReceived = 0; lastCcEvent = ''; fullText = ''; reader = null;
   try {
     // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
@@ -2252,6 +2292,7 @@ async function handleMessages(req, res) {
     }
 
     // 下游断连检测：打断 CC 上游 + 记录日志
+    if (!closeBound) { closeBound = true;
     res.on('close', () => {
       if (res.writableEnded) return; // Normal completion, not a disconnect
       aborted = true;
@@ -2275,6 +2316,7 @@ async function handleMessages(req, res) {
         elapsedMs: Date.now() - startTime,
       });
     });
+    }
 
     if (stream) {
       // ── 流式 Anthropic SSE ──
@@ -2315,10 +2357,11 @@ async function handleMessages(req, res) {
       let ctx;
       try {
         messageId = 'msg_' + randomUUID().slice(0, 12);
-        ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, upstreamError: null };
+        ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, upstreamError: null, incomplete: null };
         const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx);
         for await (const event of generator) {
           if (aborted) break;
+          if (!started && ctx.incomplete) break;
           if (!started && !event.startsWith('event: message_start')) {
             await flushBuf();
           }
@@ -2329,6 +2372,12 @@ async function handleMessages(req, res) {
           } else {
             buf.push(event);
           }
+        }
+        if (!started && ctx?.incomplete && !res.headersSent && attempt <= UPSTREAM_RETRY_MAX) {
+          try { reader?.cancel().catch(() => {}); } catch {}
+          try { abortController.abort(); } catch {}
+          await rewindUpstream('Upstream stream ended incomplete before first byte - retrying', { path: '/v1/messages', model, attempt, reason: ctx.incomplete });
+          continue attemptLoop;
         }
 
         if (!aborted) {
@@ -2388,6 +2437,10 @@ async function handleMessages(req, res) {
             // end() 而不是 destroy()：理由见 handleChatCompletions 流式超时分支
             try { res.end(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMsg }, retry_after: 5 })}\n\n`); } catch {}
           }
+        } else if (!started && !res.headersSent && isRetryableUpstreamError(e) && attempt <= UPSTREAM_RETRY_MAX) {
+          try { abortController.abort(); } catch {}
+          await rewindUpstream('Upstream stream terminated before first byte - retrying', { path: '/v1/messages', model, attempt, cause: e.message });
+          continue attemptLoop;
         } else {
           log('error', 'Anthropic stream error', { message: e.message });
           try { abortController.abort(); } catch {} // 打断 CC 上游
@@ -2501,6 +2554,12 @@ async function handleMessages(req, res) {
       {
         const incomplete = incompleteUpstreamDetail(sawFinish, finishReason);
         if (incomplete) {
+          if (!res.headersSent && attempt <= UPSTREAM_RETRY_MAX) {
+            try { reader?.cancel().catch(() => {}); } catch {}
+            try { abortController.abort(); } catch {}
+            await rewindUpstream('Upstream stream ended incomplete before first byte - retrying', { path: '/v1/messages', model, attempt, reason: incomplete });
+            continue attemptLoop;
+          }
           log('warn', 'Upstream stream incomplete', { path: '/v1/messages', reason: incomplete });
           const err = incompleteUpstreamError(incomplete);
           try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
@@ -2520,6 +2579,8 @@ async function handleMessages(req, res) {
       consecutiveTimeouts = 0;
       sendJSON(res, 200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText));
     }
+    if (attempt > 1) noteRetryRecovered({ path: '/v1/messages', model, attempt });
+    return;
   } catch (e) {
     if (abortController.signal.aborted) {
       log('warn', 'Request cancelled (client disconnected before CC response)', {
@@ -2547,11 +2608,17 @@ async function handleMessages(req, res) {
         : 'Response timeout - request timed out';
       res.setHeader('Retry-After', '5');
       sendAnthropicError(res, 429, 'rate_limit_error', timeoutMsg);
+    } else if (!res.headersSent && !aborted && isRetryableUpstreamError(e) && attempt <= UPSTREAM_RETRY_MAX) {
+      try { reader?.cancel().catch(() => {}); } catch {}
+      try { abortController.abort(); } catch {}
+      await rewindUpstream('Upstream error before first byte - retrying', { path: '/v1/messages', model, attempt, cause: e.message });
+      continue attemptLoop;
     } else {
       log('error', 'Upstream error', { message: e.message });
       try { abortController.abort(); } catch {} // 打断 CC 上游
       sendAnthropicError(res, 502, 'proxy_error', `Upstream error: ${e.message}`, 10);
     }
+  }
   }
 }
 
@@ -3150,7 +3217,7 @@ async function handleResponses(req, res) {
   const promptCacheKey = chatReq.prompt_cache_key;
   chatReq = null;
 
-  const abortController = new AbortController();
+  let abortController = new AbortController();
   let aborted = false;
   const startTime = Date.now();
   let bytesReceived = 0;
@@ -3168,6 +3235,13 @@ async function handleResponses(req, res) {
     if (!abortController.signal.aborted) { try { abortController.abort(); } catch (e2) {} }
   });
 
+  attemptLoop: for (let attempt = 1; attempt <= UPSTREAM_RETRY_MAX + 1; attempt++) {
+  if (attempt > 1 && aborted) {
+    log('info', 'Upstream retry abandoned (client disconnected during backoff)', { path: '/v1/responses', model, attempt });
+    return;
+  }
+  abortController = new AbortController();
+  bytesReceived = 0; lastCcEvent = ''; reader = null; translator = null;
   try {
     await ensureInitialized(apiKey, abortController.signal);
     const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal, promptCacheKey);
@@ -3396,6 +3470,12 @@ async function handleResponses(req, res) {
       {
         const incomplete = incompleteUpstreamDetail(sawFinish, finishReason);
         if (incomplete) {
+          if (!res.headersSent && attempt <= UPSTREAM_RETRY_MAX) {
+            try { reader?.cancel().catch(() => {}); } catch {}
+            try { abortController.abort(); } catch {}
+            await rewindUpstream('Upstream stream ended incomplete before first byte - retrying', { path: '/v1/responses', model, attempt, reason: incomplete });
+            continue attemptLoop;
+          }
           log('warn', 'Upstream stream incomplete', { path: '/v1/responses', reason: incomplete });
           const err = incompleteUpstreamError(incomplete);
           try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
@@ -3416,8 +3496,16 @@ async function handleResponses(req, res) {
       sendJSON(res, 200, buildResponsesObject(
         responseId, model, created, fullText, thinkingText, toolCalls, usage, echoOpts));
     }
+    if (attempt > 1) noteRetryRecovered({ path: '/v1/responses', model, attempt });
+    return;
   } catch (e) {
     if (e.name === 'AbortError' || e.code === 'ABORT_ERR') return;
+    if (!res.headersSent && !aborted && isRetryableUpstreamError(e) && attempt <= UPSTREAM_RETRY_MAX) {
+      try { reader?.cancel().catch(() => {}); } catch {}
+      try { abortController.abort(); } catch {}
+      await rewindUpstream('Upstream error before first byte - retrying', { path: '/v1/responses', model, attempt, cause: e.message });
+      continue attemptLoop;
+    }
     log('error', 'Responses handler error', { message: e.message });
     if (!res.headersSent) {
       sendResponsesError(res, 502, 'proxy_error', 'Upstream error: ' + e.message, 10);
@@ -3425,6 +3513,7 @@ async function handleResponses(req, res) {
       try { res.write(translator ? translator.errorEvent(e.message) : ''); } catch (e2) {}
       try { res.end(); } catch (e2) {}
     }
+  }
   }
 }
 

@@ -10,6 +10,14 @@ Built by analyzing official CLI network traffic to accurately replicate the Comm
 
 **Community**: [Linux.do](https://linux.do) — a friendly Chinese tech community.
 
+## Current console
+
+`server.mjs` listens twice: management on `127.0.0.1:3050` (`PORT` / `HOST`) and inference on `127.0.0.1:3051` (`INFERENCE_PORT`). Clients authenticate with a console-issued `sk-cc_` outlet key. An upstream `user_` credential cannot be used as that key.
+
+Compose maps `MANAGEMENT_PORT` and `INFERENCE_PORT`, both bound to `127.0.0.1` on the host. Console defaults are `CC_MAX_INFLIGHT=4` and `CC_MAX_BODY_MB=8`. `CC_INTERNAL_BASE_URL` defaults to `http://172.18.0.1:13050/v1`. Outlet keys may set `rpm_limit`, `max_concurrency`, `daily_token_limit` and `monthly_token_limit`; empty means unlimited. Token limits are checked before a request starts, so one request can finish slightly over the budget. Request logs store model, status, latency and token counts for `CC_REQUEST_LOG_DAYS` (30) and never store prompts or response bodies.
+
+In console mode, `config.json` fields `port`, `host`, `apiKey`, `projectSlug`, `logLevel` and `useProviderModels` do not select the listener or authenticate clients. `apiBase`, `zdr`, `upstreamProxy` and `logFile` are still read by the protocol layer. Use `CC_LOG_LEVEL` for log filtering. `CC_GIT_SHA` is reported by the admin health details. `/command/metrics` exists only when `CC_METRICS=1`, and then requires an admin session or `CC_METRICS_TOKEN`.
+
 ## Current console: hybrid protocol roots
 
 Management listens on 3050; private inference listens on 3051. Authenticate with a console-issued client API key, not an upstream `user_` credential.
@@ -29,7 +37,23 @@ Back up SQLite on the server before deployment. Older versions ignore group bind
 - Native input, images, tools, opaque reasoning, SSE deltas and usage are preserved. Requests always use `store:false`; server-side history, background requests and remote MCP tools are rejected. Send full history and execute MCP tools locally. Missing terminal events and failed streams are not counted as successful; `Retry-After` is retained and requests are not replayed.
 - Management generation tests default to Chat and can explicitly select native Responses.
 
-The single-file, upstream-key and CLI-fingerprint instructions below describe the older standalone backend. For the console, use `server.mjs`, the management UI and these two inference roots.
+The single-file, upstream-key and CLI-fingerprint instructions below are the upstream standalone reference. They are not the operating guide for this console. Use `server.mjs`, the management UI and the two inference roots above.
+
+## Layout
+
+```
+commandcode-proxy/
+├── server.mjs            # management :3050 and inference :3051
+├── protocols.mjs         # upstream protocol layer; keep merge-friendly
+├── lib/                  # console, scheduler, billing, usage, quotas
+├── frontend/             # Vue console; dist is tracked, images rebuild it
+├── Dockerfile            # node:24-alpine
+└── docker-compose.yml    # MANAGEMENT_PORT / INFERENCE_PORT
+```
+
+## Upstream standalone reference
+
+The quick start below, including `proxy.mjs` and calling port 3050 with a `user_` key, describes the older single-file proxy. Do not use it to operate the console.
 
 
 ## Quick Start
@@ -56,7 +80,7 @@ commandcode/
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
 ├── proxy.mjs             # Single-file proxy core (~1900 lines)
-├── Dockerfile            # Container build (node:22-alpine)
+├── Dockerfile            # Upstream notes say node:22-alpine; the console image is node:24-alpine
 ├── docker-compose.yml    # Container orchestration
 ├── .dockerignore         # Build context exclusions
 ├── .github/
@@ -572,10 +596,10 @@ The image is public — no login required to pull. After upgrading, confirm the 
 docker compose up -d
 ```
 
-The proxy will listen on `http://0.0.0.0:3050`. Set `PROXY_PORT` to customize the host port:
+The console listens on management `3050` and inference `3051`. Compose uses `MANAGEMENT_PORT` and `INFERENCE_PORT`:
 
 ```bash
-PROXY_PORT=13050 docker compose up -d
+MANAGEMENT_PORT=13050 INFERENCE_PORT=13051 docker compose up -d
 ```
 
 ### Build from Source
@@ -598,7 +622,7 @@ Only two are container-specific; everything else lives in the [Environment Varia
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `3050` | Container listen port |
-| `PROXY_PORT` | `3050` | Host port (compose only) |
+| `MANAGEMENT_PORT` / `INFERENCE_PORT` | `3050` / `3051` | Host ports (compose only) |
 
 ## In-flight Cap (Optional)
 
@@ -677,9 +701,7 @@ CC_UPSTREAM_RETRY_MAX=0 npm start        # disable retries (behaviour reverts to
 CC_UPSTREAM_RETRY_BASE_MS=800 npm start  # wider backoff (default 400ms)
 ```
 
-> **Scope**: the retry loop covers both the streaming and non-streaming paths of `/v1/chat/completions`.
-> `/v1/messages` and `/v1/responses` have a different structure and are not covered by this change (drops are still
-> reported as before).
+> **Scope**: `/v1/chat/completions`, `/v1/messages`, and translated `/v1/responses` retry before any downstream byte. Streaming Responses sends `response.created` immediately, so only a failure before that header is retried. Native `/provider/v1/responses` is not replayed.
 
 ## Memory & Deployment
 

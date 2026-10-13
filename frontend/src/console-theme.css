@@ -1,32 +1,4 @@
-/* Glacier: one continuous ice scene, with readable floating glass surfaces. */
-:root {
-  color-scheme: light;
-  --canvas: #d8e9f6; --white: #f6fbff; --forest: #e8f3fc;
-  --green: #1763c5; --mint: #4190ea; --ink: #1c3552; --muted: #536e8b;
-  --line: #96b4d044; --border: var(--line); --accent-soft: #e4f2ff99;
-  --surface: 247 252 255; --rim: 255 255 255; --edge: rgb(var(--rim) / .76);
-  --glass: linear-gradient(145deg, rgb(var(--surface) / .68), rgb(var(--surface) / .40));
-  --control: linear-gradient(155deg, #ffffffdb, #f0f9ff66 65%, #d6ecffa6);
-  --control-shadow: inset 0 1px 1px #fffffff2, inset 0 -1px 1px #77a1c326, 0 3px 9px -5px #2857834d;
-  --shadow: inset 0 1px 0 rgb(var(--rim) / .55), 0 14px 36px -26px #244f7a73;
-  --shade: linear-gradient(transparent, transparent);
-  --ok-bg: #dcf7ebbb; --ok: #146344; --warn-bg: #fff0cecc; --warn: #875612;
-  --error-bg: #ffe9e6dc; --error: #ac352e; --focus: #267ee0;
-}
-:root[data-appearance='dark'] {
-  color-scheme: dark;
-  --canvas: #0e2034; --white: #1b334c; --forest: #152e48;
-  --green: #92c7ff; --mint: #91c9ff; --ink: #e4f1ff; --muted: #b0c5dd;
-  --line: #95bfe52f; --accent-soft: #41699155; --surface: 23 44 66; --rim: 160 201 239;
-  --edge: rgb(var(--rim) / .30);
-  --glass: linear-gradient(145deg, rgb(var(--surface) / .80), rgb(var(--surface) / .55));
-  --control: linear-gradient(155deg, #476485b8, #253e5ad4 65%, #1c3451eb);
-  --control-shadow: inset 0 1px 1px #c4e5ff38, inset 0 -1px 1px #07162766, 0 3px 9px -5px #020c1aa6;
-  --shadow: inset 0 1px 0 rgb(var(--rim) / .19), 0 18px 36px -26px #020c1aca;
-  --shade: linear-gradient(135deg, #041426c7, #041423b3);
-  --ok-bg: #245b484d; --ok: #8bdfb9; --warn-bg: #73592055; --warn: #f4ce87;
-  --error-bg: #863e3a55; --error: #ffc0b7; --focus: #91c9ff;
-}
+/* Glacier surfaces. Color tokens live in tokens.css. */
 body { font-size: 14px; line-height: 1.6; }
 #app { min-height: 100dvh; isolation: isolate; }
 .glacier-scene { position: fixed; inset: 0; z-index: -1; pointer-events: none; background: var(--shade), url('./assets/glacier-wallpaper.webp') center / cover no-repeat; background-color: var(--canvas); }
@@ -186,7 +158,7 @@ tbody tr:hover { background: rgb(var(--surface) / .29); }
 }
 @media (max-width: 1200px) {
   .workspace { padding: 12px; } .sidebar { inset: 12px auto 12px 12px; width: 218px; padding-inline: 12px; }
-  .workspace-main { margin-left: 232px; width: calc(100% - 232px); }
+  .workspace-main { margin-left: 230px; width: calc(100% - 230px); }
   .brand { font-size: 16px; gap: 8px; } .brand-mark { width: 34px; height: 34px; }
   .topbar { padding-inline: 24px; } .page-content { padding: 24px 22px 0; }
   .stat-card { padding: 20px; } .stat-card>strong { font-size: 30px; }
@@ -224,6 +196,16 @@ tbody tr:hover { background: rgb(var(--surface) / .29); }
   .login-layout { margin: 8px; border-radius: 24px; } .login-story { min-height: auto; padding: 28px; } .login-story-main { padding-top: 30px; }
   .login-form-area { padding: 84px 26px 65px; }
 }
+.topbar { position: relative; }
+.field-error { color: var(--error); }
+.skeleton-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
+.skeleton-grid span { height: 96px; border-radius: 22px; background: rgb(var(--surface) / .45); }
+.toast-stack { position: fixed; right: 24px; bottom: 24px; z-index: 200; display: flex; flex-direction: column; gap: 10px; }
+.toast-stack .toast { position: static; transform: none; left: auto; }
+.alert-panel { position: absolute; top: 64px; right: 24px; width: min(360px, calc(100vw - 32px)); padding: 12px; border-radius: 18px; background: var(--white); border: 1px solid var(--line); box-shadow: var(--shadow); }
+.alert-panel button { width: 100%; display: grid; gap: 4px; text-align: left; padding: 10px; border-radius: 12px; }
+.alert-panel button:hover { background: var(--accent-soft); }
+.usage-chart { width: 100%; height: 120px; color: var(--green); padding: 12px 20px 20px; }
 @media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
   .sidebar, .workspace-main, .panel, .stat-card, .overview-hero, .endpoint-card, .workspace .usage-grid .usage-box, .modal, .login-layout { background: var(--white); backdrop-filter: none; border-color: var(--muted); }
 }

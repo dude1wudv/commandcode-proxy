@@ -16,5 +16,6 @@ const emit = defineEmits<{ edit: [group: Group]; remove: [group: Group]; browse:
         <td><div class="row-actions"><button class="icon-button" :aria-label="`编辑分组 ${group.name}`" @click="emit('edit', group)"><Pencil :size="16" /></button><button class="icon-button danger" :disabled="busy || group.id === 'default' || upstreams.some(row => row.group_id === group.id) || clients.some(row => row.group_id === group.id)" :aria-label="`删除分组 ${group.name}`" title="仅可删除没有账号和出口 key 的非默认分组" @click="emit('remove', group)"><Trash2 :size="16" /></button></div></td>
       </tr></tbody>
     </table></div>
+    <div v-if="!groups.length" class="empty-state"><Layers3 :size="32" /><h3>还没有分组</h3><p>现有账号会留在默认分组。</p></div>
   </section>
 </template>

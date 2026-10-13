@@ -1,0 +1,10 @@
+<script setup lang="ts">
+import { ArrowDownToLine, Copy } from 'lucide-vue-next';
+import { useConsole } from '../composables/useConsole';
+import { countText, dateText } from '../utils/format';
+const workspace = useConsole();
+</script>
+<template>
+  <div class="info-strip"><span>请求日志保留模型、状态、耗时和 token。不记录提示词、响应正文或完整密钥。</span></div>
+  <section class="panel table-panel"><div class="table-toolbar"><input v-model="workspace.requestFilter.model" aria-label="按模型筛选" placeholder="模型" /><select v-model="workspace.requestFilter.status" aria-label="按结果筛选"><option value="">全部结果</option><option value="ok">成功</option><option value="error">失败</option></select><button class="button secondary" :disabled="workspace.busy === 'requests'" @click="workspace.applyRequestFilter">筛选</button></div><div class="table-scroll"><table><thead><tr><th scope="col">时间</th><th scope="col">请求 ID</th><th scope="col">模型</th><th scope="col">状态</th><th scope="col">token</th><th scope="col">耗时</th><th scope="col">重试</th></tr></thead><tbody><tr v-for="row in workspace.requests" :key="row.id"><td class="small nowrap">{{ dateText(row.ts) }}</td><td><code>{{ row.request_id }}</code> <button class="text-button" :aria-label="`复制请求 ${row.request_id}`" @click="workspace.copyText(row.request_id)"><Copy :size="14" /></button></td><td>{{ row.model || '—' }}</td><td><span :class="['pill', row.status >= 200 && row.status < 400 ? 'ready' : 'cooling']">{{ row.status || '—' }}</span></td><td>{{ countText(row.input_tokens + row.output_tokens) }}<small class="cell-sub">缓存 {{ countText(row.cached_tokens) }}</small></td><td>{{ row.duration_ms }} ms</td><td>{{ row.retries }}</td></tr></tbody></table></div><div v-if="workspace.loaded && !workspace.requests.length" class="empty-state"><h3>还没有请求日志</h3></div><footer v-else class="table-footer"><span>已显示 {{ workspace.requests.length }} 条</span><button class="text-button" :disabled="workspace.busy === 'requests'" @click="workspace.moreRequests">加载更早记录 <ArrowDownToLine :size="15" /></button></footer></section>
+</template>

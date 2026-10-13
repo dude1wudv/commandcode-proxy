@@ -42,6 +42,7 @@ async function startFlakyUpstream(script) {
       }
       state.generateCalls++;
       const action = script[Math.min(state.generateCalls - 1, script.length - 1)];
+      if (action === 'refuse') { req.socket.destroy(); return; }
       res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
       res.flushHeaders();                                  // 头必须真的发出去，否则代理还卡在 fetch
       if (action === 'hang') return;                       // 已发头但一个字都不吐，等看门狗
@@ -84,6 +85,8 @@ async function setupRetry(script, env = {}) {
   return {
     mock, proxy,
     chat: (stream = true) => proxy.post('/v1/chat/completions', { ...CHAT, stream }, AUTH),
+    messages: (stream = false) => proxy.post('/v1/messages', { model: 'm', max_tokens: 32, messages: [{ role: 'user', content: 'hi' }], stream }, AUTH),
+    responses: (stream = false) => proxy.post('/v1/responses', { model: 'm', input: 'hi', stream }, AUTH),
     async close() { await proxy.close(); await mock.close(); },
   };
 }
@@ -274,5 +277,51 @@ test('客户端断连 → 打断上游且不重试', async () => {
     await sleep(300);
     assert.equal(s.mock.state.generateCalls, 1, '客户端断连后不得再发起重试');
     assert.doesNotMatch(s.proxy.logs(), /retrying/);
+  } finally { await s.close(); }
+});
+
+test('Messages 流式：未吐字前闪断由内部重试消化', async () => {
+  const s = await setupRetry(['cut-before-byte', 'ok']);
+  try {
+    const r = await s.messages(true);
+    const text = await r.text();
+    assert.equal(r.status, 200);
+    assert.match(text, /recovered/);
+    assert.equal(s.mock.state.generateCalls, 2);
+    await waitForLog(s.proxy, /Upstream stream terminated before first byte - retrying/);
+    await waitForLog(s.proxy, /Upstream retry recovered/);
+  } finally { await s.close(); }
+});
+
+test('Messages 非流式：未吐字前闪断由内部重试消化', async () => {
+  const s = await setupRetry(['cut-before-byte', 'ok']);
+  try {
+    const r = await s.messages(false);
+    const body = await r.json();
+    assert.equal(r.status, 200);
+    assert.match(JSON.stringify(body), /recovered/);
+    assert.equal(s.mock.state.generateCalls, 2);
+  } finally { await s.close(); }
+});
+
+test('Responses 非流式：未吐字前闪断由内部重试消化', async () => {
+  const s = await setupRetry(['cut-before-byte', 'ok']);
+  try {
+    const r = await s.responses(false);
+    const body = await r.json();
+    assert.equal(r.status, 200);
+    assert.match(JSON.stringify(body), /recovered/);
+    assert.equal(s.mock.state.generateCalls, 2);
+  } finally { await s.close(); }
+});
+
+test('Responses 流式：连接在响应头之前失败才会重试', async () => {
+  const s = await setupRetry(['refuse', 'ok']);
+  try {
+    const r = await s.responses(true);
+    const text = await r.text();
+    assert.equal(r.status, 200);
+    assert.match(text, /recovered/);
+    assert.equal(s.mock.state.generateCalls, 2);
   } finally { await s.close(); }
 });

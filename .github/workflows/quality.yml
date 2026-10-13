@@ -63,5 +63,12 @@ jobs:
       - name: Test frontend
         run: pnpm test
 
+      - name: Lint console
+        run: node lint.mjs
+
       - name: Build frontend
         run: pnpm build
+
+      - name: Check committed frontend dist
+        working-directory: .
+        run: git diff --exit-code -- frontend/dist

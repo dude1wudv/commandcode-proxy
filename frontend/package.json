@@ -8,6 +8,7 @@
     "dev": "vite --host 127.0.0.1",
     "build": "vue-tsc -b && vite build",
     "test": "vitest run",
+    "lint:check": "node lint.mjs",
     "format": "prettier --write src"
   },
   "dependencies": {
@@ -18,7 +19,12 @@
     "@vitejs/plugin-vue": "^5.2.4",
     "@vue/test-utils": "^2.4.6",
     "jsdom": "^26.1.0",
+    "@eslint/js": "^9.36.0",
+    "eslint": "^9.36.0",
+    "eslint-plugin-vue": "^10.5.0",
+    "globals": "^16.4.0",
     "prettier": "^3.6.2",
+    "typescript-eslint": "^8.45.0",
     "typescript": "~5.8.3",
     "vite": "^6.4.1",
     "vitest": "^3.2.4",

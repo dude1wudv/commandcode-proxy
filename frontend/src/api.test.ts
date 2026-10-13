@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, api, session } from './api';
+import { api, session } from './api';
 
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 

@@ -52,7 +52,8 @@ test('v1 migration preserves three accounts, both existing keys and protected da
     repo.close(); repo = new Repository(path, MASTER_KEY);
     assert.equal(repo.get('upstreams', row.id).group_id, other.id);
     assert.equal(repo.list('groups').length, 2);
-    assert.deepEqual(repo.db.prepare('SELECT version FROM migrations ORDER BY version').all().map(row => row.version), [1, 2]);
+    assert.deepEqual(repo.db.prepare('SELECT version FROM migrations ORDER BY version').all().map(row => row.version), [1, 2, 3]);
+    assert.equal(repo.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='request_logs'").get().name, 'request_logs');
   } finally { repo.close(); }
 });
 

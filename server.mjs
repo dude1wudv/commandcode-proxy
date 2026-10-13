@@ -17,6 +17,13 @@ const app = await createApplication({
   assetsPath: resolve(root, 'frontend/dist'), trustProxy: true,
   maxInflight: Number(process.env.CC_MAX_INFLIGHT || 4),
   maxBodyBytes: Number(process.env.CC_MAX_BODY_MB || 8) * 1024 * 1024,
+  internalBaseUrl: process.env.CC_INTERNAL_BASE_URL || 'http://172.18.0.1:13050/v1',
+  gitSha: process.env.CC_GIT_SHA || 'dev',
+  metricsEnabled: process.env.CC_METRICS === '1',
+  metricsToken: process.env.CC_METRICS_TOKEN || '',
+  requestLogDays: Number(process.env.CC_REQUEST_LOG_DAYS || 30),
+  alertBalanceUsd: Number(process.env.CC_ALERT_BALANCE_USD || 5),
+  billingIntervalMs: Number(process.env.CC_BILLING_INTERVAL_MS || 2 * 60 * 60 * 1000),
 });
 const configuredKeepAliveTimeout = Number.parseInt(process.env.CC_KEEPALIVE_TIMEOUT_MS || '', 10);
 const keepAliveTimeout = Number.isFinite(configuredKeepAliveTimeout) && configuredKeepAliveTimeout > 0
