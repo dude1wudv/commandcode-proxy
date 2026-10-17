@@ -4,6 +4,12 @@
 
 A multi-account Command Code reverse proxy with a management console and OpenAI / Anthropic compatible endpoints.
 
+Current console release: **[v1.1.0](docs/releases/v1.1.0.md)**. The console release version is separate from the emulated upstream CLI protocol version, which remains `command-code@1.81.0`.
+
+Messages streams retain received text, thinking and tool-argument usage on interruption, including legacy `event.args`. Missing or invalid zero output usage falls back to the accumulated semantic UTF-8 byte count divided by four, rounded up, with `output_tokens_estimated` provenance. Positive upstream usage takes precedence; known input/cache counts are preserved, and empty streams stay at zero. This is an estimate, not a tokenizer or recovery of unseen upstream output.
+
+Messages now defaults to a 180-second upstream read-idle limit (`CC_STREAM_IDLE_MS` overrides it), with SSE heartbeats about every 10 seconds even before first content. Chat / Responses retain 30-second defaults. Heartbeats do not reset upstream activity, and failed streams remain failures without transparent replay after SSE starts. Usage is accumulated in memory and logged once at completion/disconnection, not durably billed per chunk. SQLite migration v4 adds estimate provenance without rewriting historical usage.
+
 Built by analyzing official CLI network traffic to accurately replicate the Command Code API request protocol, including device-fingerprint and lifecycle pre-requests.
 
 **Features**: OpenAI Chat Completions / **Responses API (`/v1/responses`)** + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging

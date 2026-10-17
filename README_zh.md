@@ -4,6 +4,8 @@
 
 带多账号管理控制台的 Command Code 反代代理，提供 OpenAI / Anthropic 兼容接口。
 
+当前控制台发行版：**[v1.1.0](docs/releases/v1.1.0.md)**。控制台版本与模拟的上游 CLI 协议版本相互独立；后者仍为 `command-code@1.81.0`。
+
 逐条对齐官方 npm 包源码（`command-code@1.81.0`；`dist/cli.mjs` 只是压缩、**没有混淆**）。上游 npm 走到更高版本时代理只打**漂移告警**，不会静默改版本号（见[反检测](#反检测)）。
 
 **完整功能**：OpenAI Chat Completions / **Responses API（`/v1/responses`）** + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止）| 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
