@@ -4,7 +4,7 @@
 
 A multi-account Command Code reverse proxy with a management console and OpenAI / Anthropic compatible endpoints.
 
-Current console release: **[v1.1.0](docs/releases/v1.1.0.md)**. The console release version is separate from the emulated upstream CLI protocol version, which remains `command-code@1.81.0`.
+Current console release: **[v1.1.1](docs/releases/v1.1.1.md)**, synchronized with upstream [`972828a`](https://github.com/MAXeaglet/commandcode-proxy/commit/972828aff37f07c9cb12959bc6a1f4d44aaa005a). The console release version is separate from the emulated upstream CLI protocol version, which remains `command-code@1.81.0`.
 
 Messages streams retain received text, thinking and tool-argument usage on interruption, including legacy `event.args`. Missing or invalid zero output usage falls back to the accumulated semantic UTF-8 byte count divided by four, rounded up, with `output_tokens_estimated` provenance. Positive upstream usage takes precedence; known input/cache counts are preserved, and empty streams stay at zero. This is an estimate, not a tokenizer or recovery of unseen upstream output.
 
@@ -12,7 +12,7 @@ Messages now defaults to a 180-second upstream read-idle limit (`CC_STREAM_IDLE_
 
 Built by analyzing official CLI network traffic to accurately replicate the Command Code API request protocol, including device-fingerprint and lifecycle pre-requests.
 
-**Features**: OpenAI Chat Completions / **Responses API (`/v1/responses`)** + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
+**Features**: OpenAI Chat Completions / **Responses API (`/v1/responses`)** + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output guard (429 non-streaming / response.failed streaming) | Consecutive timeout → 429 auto-retry | Privacy-aware logging
 
 **Community**: [Linux.do](https://linux.do) — a friendly Chinese tech community.
 
@@ -21,6 +21,8 @@ Built by analyzing official CLI network traffic to accurately replicate the Comm
 `server.mjs` listens twice: management on `127.0.0.1:3050` (`PORT` / `HOST`) and inference on `127.0.0.1:3051` (`INFERENCE_PORT`). Clients authenticate with a console-issued `sk-cc_` outlet key. An upstream `user_` credential cannot be used as that key.
 
 Compose maps `MANAGEMENT_PORT` and `INFERENCE_PORT`, both bound to `127.0.0.1` on the host. Console defaults are `CC_MAX_INFLIGHT=4` and `CC_MAX_BODY_MB=8`. `CC_INTERNAL_BASE_URL` defaults to `http://172.18.0.1:13050/v1`. Outlet keys may set `rpm_limit`, `max_concurrency`, `daily_token_limit` and `monthly_token_limit`; empty means unlimited. Token limits are checked before a request starts, so one request can finish slightly over the budget. Request logs store model, status, latency and token counts for `CC_REQUEST_LOG_DAYS` (30) and never store prompts or response bodies.
+
+Oversized requests return `413` with both the configured limit and the declared body size, or a received-size lower bound marked `+` for chunked/invalid lengths. This diagnostic does not raise the console's default 8 MB cap. Responses releases its local raw request reference after translation; this is not a guarantee that all middleware references have been reclaimed.
 
 In console mode, `config.json` fields `port`, `host`, `apiKey`, `projectSlug`, `logLevel` and `useProviderModels` do not select the listener or authenticate clients. `apiBase`, `zdr`, `upstreamProxy` and `logFile` are still read by the protocol layer. Use `CC_LOG_LEVEL` for log filtering. `CC_GIT_SHA` is reported by the admin health details. `/command/metrics` exists only when `CC_METRICS=1`, and then requires an admin session or `CC_METRICS_TOKEN`.
 
@@ -156,6 +158,40 @@ authority for actual retention and provider availability.
 
 > ⚠️ **Memory amplification**: a request body exists in several copies before it reaches upstream; measured peak ≈ body size × **5.1–7.4** (7 MB → +52 MB, 20 MB → +116 MB, while a request rejected with `413` costs only ×1.05). The default `CC_MAX_BODY_MB=100` therefore implies up to ~550 MB for a **single** request, and that limit is per-request, not global. See [Memory & Deployment](#memory--deployment).
 
+### Device fingerprint
+
+Relevant config: `fingerprintSalt` / `CC_FINGERPRINT_SALT`, `deviceProjectDir` / `CC_DEVICE_PROJECT_DIR`.
+
+The device fingerprint reported to `/alpha/fingerprint/record` is **derived deterministically** from the API key (`fpDigest(apiKey, field) = sha256(salt + "\\0" + apiKey + "\\0" + field)`), so one key is always one device:
+
+| Event | Old behaviour (random) | Now (derived) |
+|---|---|---|
+| Process restart | Map cleared → **new machine** | same machine |
+| Second instance | same key = **two machines** | same machine |
+| Session expiry (12h) | `keyStateStore.delete` → **new machine every 12h** | same machine |
+
+> The 12h case was the most visible: a real user does not replace their computer twice a day, and upstream's `device_fingerprints` table is keyed on `(userId, thumbmark)`.
+
+**Why derived rather than "pick a device from a hash bucket"** — a fixed pool caps entropy at the pool size, so once the number of keys exceeds it, keys *must* share a fingerprint. With ~50 keys and a 1000-entry pool, ~2 keys collide; with a 100-entry pool, ~20 do. A shared `thumbmark` under two different `userId`s is direct evidence of multi-account-same-machine — exactly what you don't want to manufacture. Derivation keeps every key a distinct device (collision probability 2⁻²⁵⁶) while still being stable.
+
+```bash
+CC_FINGERPRINT_SALT=some-local-secret npm start   # optional: bulk-reset every key's device identity
+CC_DEVICE_PROJECT_DIR='C:\\Users\\you\\projects\\app' npm start   # optional: change the fabricated project dir (slug follows)
+```
+
+The salt is optional but recommended: without it the derivation is a pure function of the API key, so anyone who knows the scheme could recompute your users' fingerprints. With it, the same key yields different devices on different deployments, at no cost.
+
+**The signal values are fabricated too.** The official CLI reads the real machine (Windows registry MachineGuid, NIC MACs, `os.userInfo`, `git config`); this proxy derives plausible-looking substitutes from the API key — MachineGuid's `8-4-4-4-12` shape, `xx:xx:xx:xx:xx:xx` MACs, a `DESKTOP-xxxxxx` hostname, a readable git email. Those raw values never leave process memory; only their hashes go on the wire.
+
+**Pool selection scores-and-takes-the-max rather than using modulo** — modulo would rotate *every* key's device whenever the pool grows; taking the max only affects keys where the new candidate happens to win.
+
+The hash construction follows the official CLI (`buildMachineFingerprint` / `hashSignal` in `command-code`) — `thumbmark = sha256(IB + "\0machine\0" + [machineId, macs.join(",")].join("|"))` with `IB = "command-code:device-fingerprint:v1"`, and each component hashed as `sha256(IB + "\0" + value.toLowerCase())`. The previous implementation hashed random hex without the `IB` prefix and built the thumbmark from the component *hashes*; upstream cannot recompute either way (it never sees the raw `machineId`), so it was undetectable — but it is now aligned.
+
+> Not addressed here: the appearance pool is still all high-end desktop CPUs and the timezone is drawn uniformly from a global pool.
+>
+> `timezone` is the **client machine's OS timezone** (`Intl.DateTimeFormat().resolvedOptions().timeZone`), *not* the egress IP's. So do **not** bind it to the egress IP: a user in mainland China reaching this service through a proxy normally has a machine timezone that does not match where the traffic exits, and that mismatch is the norm rather than an anomaly.
+>
+> The property that matters is therefore the **distribution across your own user base**, not agreement with the IP. If your users are concentrated in one region, drawing timezones uniformly from 15 global zones makes every account look like it belongs to a different continent. Set the pool to match who actually uses the deployment — this is an operator decision, and for a single-region user base it means narrowing (or weighting) `FINGERPRINT_TZS` rather than randomising it globally.
 ### Tool screenshot budget
 
 Images inside tool results are sent upstream as **separate** `image` blocks (an `input_image` inside
@@ -401,7 +437,7 @@ Produced by the proxy itself:
 | `401` | API key missing / malformed (must start with `user_`; sent via `Authorization: Bearer` or `x-api-key`) |
 | `404` | Unknown path |
 | `413` | Body exceeds `CC_MAX_BODY_MB` (connection kept alive and drained, not reset) |
-| `429` | Zero output tokens, stream idle timeout (30s streaming / 90s non-streaming), or an upstream rate-limit mapping — all carry `Retry-After` so SDKs back off; after 3 consecutive timeouts a "reduce context" hint is returned |
+| `429` | Zero output tokens (non-streaming only; streaming reports 200 + `response.failed`, see "Zero-Output Guard"), stream idle timeout (30s streaming / 90s non-streaming), or an upstream rate-limit mapping — all carry `Retry-After` so SDKs back off; after 3 consecutive timeouts a "reduce context" hint is returned |
 | `502` | CC upstream error (connection-level failures such as `fetch failed` also land here) |
 | `503` | `CC_MAX_INFLIGHT` is set and the in-flight cap is exceeded (`type: server_busy`) |
 
@@ -644,6 +680,8 @@ Over the limit it returns `503` + `Retry-After: 5` + `type: server_busy` — a s
 
 **Why it exists**: memory is `in-flight × (0.13 MB + 5.5 × body_MB)`. `CC_MAX_BODY_MB` bounds only the **per-request** term; nothing bounds the multiplier — at the default 100 MB, N concurrent requests can cost N × 550 MB.
 
+> **Why the default body cap stays at 100 MB**: [#7](https://github.com/MAXeaglet/commandcode-proxy/issues/7) recorded a legitimate multimodal session (21 base64 images, ~10.11 MiB) hitting the old 10 MB cap, so the threshold cannot be lowered without breaking real usage — which is exactly why the concurrency side has to be bounded instead. The startup warning about implied worst-case memory is advisory; `CC_MAX_INFLIGHT` is the enforcement.
+
 > ⚠️ Enabling this is **not** the same as being memory-safe: 32 × 550 MB still exceeds a small box. For a hard bound, lower `CC_MAX_BODY_MB` **as well**.
 
 ## Upstream Idle Timeouts
@@ -740,7 +778,7 @@ The body exists in several copies before being forwarded: `chunks[]` / `Buffer.c
 | 20 MB | 100 MB | +116 MB (5.8×) | 200 |
 | 20 MB | 8 MB | +21 MB (1.05×) | **413** |
 
-At startup a `warn` is logged when the implied worst case is ≥ 500 MB. The limit is **per request** and the proxy does no in-flight limiting of its own — a public deployment must add both at the reverse proxy.
+At startup a `warn` is logged when the implied worst case is ≥ 500 MB. The body limit is **per request** — cap the multiplier with `CC_MAX_INFLIGHT` (in-process, global only), and add per-IP / per-key limits in the reverse proxy. A public deployment should do both.
 
 ### Suggested nginx front
 

@@ -11,6 +11,7 @@ import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { parseProxyUrl, proxyFetch, proxyLabel } from './lib/proxy.mjs';
 import { createMessagesUsage } from './lib/messages-usage.mjs';
+import { bodyLimitError } from './lib/http.mjs';
 
 const requestContext = new AsyncLocalStorage();
 export const runProtocol = (context, fn) => requestContext.run(context, fn);
@@ -97,6 +98,18 @@ const FINGERPRINT_TZS = [
 ];
 const FINGERPRINT_MAC_COUNT_RANGE = [2, 3, 4, 5]; // 随机 2~5 个 MAC
 
+// ── 为什么指纹必须由 apiKey 确定性派生（而不是随机） ──────────────
+// 指纹代表「这个账号对应的那台设备」。原实现每进程随机生成一台新机器，
+// 会在三个场景下毫无理由地漂移：① 进程重启 ② 多实例各算各的
+// ③ session 过期清理连带 keyStateStore.delete。设备身份无故更换本身就是信号。
+//
+// 也不能退化成「按 key 取哈希桶选设备」：桶方案的熵上限就是桶数，key 数一旦
+// 超过桶数必然出现多个 key 共用指纹，而上游 device_fingerprints 表对
+// (userId, thumbmark) 建了唯一索引 —— 共用指纹等于「多账号同机」的直接证据。
+// 派生方案每个 key 都是独立设备，碰撞概率 2^-256。
+//
+// 原始信号值（MachineGuid / MAC / 主机名 / git 邮箱）只存在于本进程内存，
+// 出网的永远只有它们的哈希。
 // CLI 的根盐（buildMachineFingerprint 常量 sb）
 const FP_SALT = 'command-code:device-fingerprint:v1';
 // 设备档案：指纹 / config.environment / config.workingDir / x-project-slug / lifecycle.os 共用同一份，
@@ -239,12 +252,19 @@ export function startProtocolMaintenance() {
   return () => clearInterval(timer);
 }
 
-// 请求体大小上限：默认 100MB，可用环境变量 CC_MAX_BODY_MB 覆盖（正整数，单位 MB）
+// 请求体大小上限：默认 100MB，可用环境变量 CC_MAX_BODY_MB 覆盖（正整数，单位 MB）。
+// 默认值保持 100MB（573e260 为修 issue #7 设定）——不要下调，理由是有实际证据的：
+//   #7 的真实触发场景是多模态长会话，21 张 Base64 图片累积到约 10.11 MiB 的合法请求，
+//   下调到 4~8MB 会把这类请求整体挡在门外。#7 的「Connection error」症状由
+//   「超限返回 413 + 排空连接」这条路径解决，与阈值取值无关；但阈值决定了功能边界，
+//   所以默认值必须容纳真实的多模态上下文。
 // ⚠️ 内存特性（issue #20 实测）：请求体在转发到上游前会同时存在多份副本 ——
 //    chunks[] / Buffer.concat / utf8 字符串 / JSON.parse 对象树 / buildCcRequest 重建对象树 / JSON.stringify 序列化体。
 //    实测峰值 ≈ body 大小 × 5.1~7.4（7MB→+52MB，20MB→+116MB；而 413 拒绝路径只要 ×1.05）。
 //    故 100MB 上限意味着「单个请求」最坏可吃 ~550MB，且该上限是每请求的、不是全局的。
-//    公网/多用户部署请在反向代理层同时限制 body 大小与在途请求数（见 README「内存与部署」）。
+//    正因为阈值必须留足，#20 的第二半必须补齐：并发侧要有约束。
+//    进程内可用 CC_MAX_INFLIGHT，边缘侧用反向代理 limit_conn
+//    （见 README「内存与部署」）。
 const MAX_BODY_SIZE = (() => {
   const mb = Number.parseInt(process.env.CC_MAX_BODY_MB ?? '', 10);
   return Number.isFinite(mb) && mb > 0 ? mb * 1024 * 1024 : 100 * 1024 * 1024;
@@ -379,6 +399,7 @@ function deriveSessionId(apiKey, ccBody) {
 }
 
 function getSessionId(incomingHeaders, apiKey, promptCacheKey, ccBody) {
+
   const candidates = [
     incomingHeaders['x-session-id'],
     incomingHeaders['x-claude-code-session-id'],
@@ -416,6 +437,7 @@ function getOrCreateKeyState(apiKey) {
   state.lastSeen = Date.now();
   return state;
 }
+
 
 setInterval(() => {
   const now = Date.now();
@@ -522,6 +544,79 @@ function getDateStr() {
 
 // ── CC 请求体构建 ─────────────────────────────────
 
+/**
+ * params.system 的块形态（toWireSystem），非末块补 \n，可带缓存断点。
+ * @typedef {Object} CcSystemBlock
+ * @property {'text'} type
+ * @property {string} text
+ * @property {{ type: 'ephemeral' }} [cache_control]
+ */
+
+/**
+ * messages 里的内容块联合类型：text / image / reasoning / tool-call / tool-result。
+ * @typedef {Object} CcTextPart
+ * @property {'text'} type
+ * @property {string} text
+ * @property {{ type: 'ephemeral' }} [cache_control]
+ * @typedef {Object} CcImagePart
+ * @property {'image'} type
+ * @property {string} image        // data:<mime>;base64,...
+ * @property {string} [mimeType]
+ * @typedef {Object} CcReasoningPart
+ * @property {'reasoning'} type
+ * @property {string} text
+ * @typedef {Object} CcToolCallPart
+ * @property {'tool-call'} type
+ * @property {string} toolCallId
+ * @property {string} toolName
+ * @property {string|object} input
+ * @typedef {Object} CcToolResultPart
+ * @property {'tool-result'} type
+ * @property {string} toolCallId
+ * @property {string} toolName
+ * @property {{ type: 'text', value: string }} output
+ * @typedef {CcTextPart|CcImagePart|CcReasoningPart|CcToolCallPart|CcToolResultPart} CcContentPart
+ */
+
+/**
+ * wire 格式的单条消息（buildCcRequest 的 ccMessages 元素）。
+ * @typedef {Object} CcMessage
+ * @property {'user'|'assistant'|'tool'} role
+ * @property {CcContentPart[]} content
+ */
+
+/**
+ * 信封 params 块。
+ * @typedef {Object} CcRequestParams
+ * @property {string} model
+ * @property {CcMessage[]} messages
+ * @property {CcSystemBlock[]} [system]
+ * @property {number} max_tokens
+ * @property {true} stream            // CC API 总是 stream
+ * @property {number} [temperature]
+ * @property {string} [reasoning_effort]
+ * @property {{ name: string, description: string, input_schema: object }[]} tools
+ * @property {{ type: 'auto'|'none'|'any'|'tool', name?: string }} [tool_choice]
+ * @property {boolean} [parallel_tool_calls]
+ */
+
+/**
+ * /alpha/generate 的 9 键信封（threadId 由 forwardToCC 重排时插入）。
+ * @typedef {Object} CcRequestBody
+ * @property {{ workingDir: string, date: string, environment: string, structure: string[],
+ *   isGitRepo: boolean, currentBranch: string, mainBranch: string, gitStatus: string,
+ *   recentCommits: string[] }} config
+ * @property {null} memory
+ * @property {null} taste
+ * @property {null} skills
+ * @property {'standard'} permissionMode
+ * @property {string} mode
+ * @property {CcRequestParams} params
+ */
+
+/**
+ * @returns {CcRequestBody}
+ */
 function buildCcRequest(openaiReq) {
   const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq;
 
@@ -551,6 +646,7 @@ function buildCcRequest(openaiReq) {
   const chatMessages = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
 
   // Build tool_call_id → tool_name reverse lookup
+  // 名字原样透传（理由见 toWireToolName 删除处的注释）。
   const toolNameMap = {};
   for (const msg of chatMessages) {
     if (msg.role === 'assistant' && msg.tool_calls) {
@@ -617,6 +713,7 @@ function buildCcRequest(openaiReq) {
       return { role: 'assistant', content: parts };
     }
     if (msg.role === 'tool') {
+      // toolName 与上面 tool-call 里的一致（同一张 map），不重命名
       return {
         role: 'tool',
         content: [{
@@ -713,6 +810,7 @@ function buildCcRequest(openaiReq) {
   return body;
 }
 
+
 // CLI 的 toWireToolOutput：只取文本块，用 '\n' 拼接
 function toWireToolOutputValue(content) {
   if (typeof content === 'string') return content;
@@ -735,6 +833,7 @@ function createSseTranslator(model, completionId, created) {
   let sentRole = false;
   let finishReason = null;
   let unsupportedFinishReason = null;
+
   let usage = null;
   let toolCallIndex = 0;
   let capturedCacheWrite;
@@ -875,6 +974,7 @@ function createSseTranslator(model, completionId, created) {
       const standard = incompleteUpstreamDetail(sawFinish, finishReason);
       if (standard) return standard;
       if (!unsupportedFinishReason) return null;
+
       return unsupportedFinishReason === 'upstream_error'
         ? 'provider reported an upstream connection failure'
         : `provider reported an unsupported finish reason (${unsupportedFinishReason})`;
@@ -1096,20 +1196,13 @@ function readBody(req) {
       if (totalSize > MAX_BODY_SIZE) {
         settled = true;
         chunks.length = 0;
-        const mb = Math.round(MAX_BODY_SIZE / 1024 / 1024);
-        const declared = Number.parseInt(req.headers['content-length'] ?? '', 10);
-        const known = Number.isFinite(declared) && declared > 0;
-        const bytes = known ? declared : totalSize;
-        const sizeNote = ` (body is ${(bytes / 1048576).toFixed(1)}MB${known ? '' : '+'})`;
+        const err = bodyLimitError(req, totalSize, MAX_BODY_SIZE);
         log('warn', 'Request body rejected (too large)', {
           path: req.url,
-          limitMB: mb,
-          bodyMB: +(bytes / 1048576).toFixed(1),
-          exact: known,
+          limitMB: MAX_BODY_SIZE / 1048576,
+          bodyMB: +(err.bodyBytes / 1048576).toFixed(1),
+          exact: err.bodySizeExact,
         });
-        const err = new Error(`Request body exceeds ${mb}MB limit${sizeNote}`);
-        err.statusCode = 413;
-        err.bodyBytes = bytes;
         reject(err);
         return;
       }
@@ -1295,6 +1388,7 @@ async function handleChatCompletions(req, res) {
 
   // 构建 CC 请求体
   const ccBody = buildCcRequest(openaiReq);
+
   const promptCacheKey = openaiReq.prompt_cache_key;
   openaiReq = null;
 
@@ -1351,6 +1445,7 @@ async function handleChatCompletions(req, res) {
       cachedInputTokens: translator?.cachedInputTokens ?? 0,
     });
     if (!abortController.signal.aborted) {
+
       try {
         res.write(`data: ${JSON.stringify({
           id: completionId,
@@ -1639,7 +1734,7 @@ async function handleChatCompletions(req, res) {
               // 非流式路径会掉进 default 打成 'Unknown CC event type' —— 上游每个响应都会发，
               // 于是线上刷屏。它们本身不携带内容（内容在 text-delta），纯粹是噪音。
               case 'text-start': case 'text-end': case 'start': case 'start-step':
-              case 'reasoning-start': case 'reasoning-end': case 'finish-step':
+              case 'reasoning-start': case 'reasoning-end':
               case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
               case 'tool-error':
                 // Silent - no user-visible content
@@ -1812,6 +1907,7 @@ function mapAnthropicStopReason(finishReason) {
 // pause_turn 没有对应值：折成 'stop' 是谎报完成（正是要修的问题），
 // 折成 'length' 至少如实表达了「输出不完整」，下游的截断处理会做对的事。
 const OPENAI_FINISH_REASONS = new Set(['stop', 'length', 'tool_calls', 'content_filter', 'function_call']);
+
 
 function toOpenAIFinishReason(finishReason) {
   if (finishReason === 'pause_turn') return 'length';
@@ -2316,6 +2412,7 @@ async function handleMessages(req, res) {
   // Convert Anthropic → OpenAI → CC
   let openaiReq = convertAnthropicToOpenAI(anthropicReq);
   const ccBody = buildCcRequest(openaiReq);
+
   openaiReq = null;
   anthropicReq = null;
 
@@ -2593,7 +2690,7 @@ async function handleMessages(req, res) {
               // 非流式路径会掉进 default 打成 'Unknown CC event type' —— 上游每个响应都会发，
               // 于是线上刷屏。它们本身不携带内容（内容在 text-delta），纯粹是噪音。
               case 'text-start': case 'text-end': case 'start': case 'start-step':
-              case 'reasoning-start': case 'reasoning-end': case 'finish-step':
+              case 'reasoning-start': case 'reasoning-end':
               case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
               case 'tool-error':
                 // Silent - no user-visible content
@@ -2711,9 +2808,11 @@ function responsesTextOf(content) {
   return content.map(p => (p && typeof p === 'object' ? (p.text || '') : '')).join('');
 }
 
+
 function isResponsesImagePart(part) {
   return !!part && typeof part === 'object' && (part.type === 'input_image' || part.image_url !== undefined);
 }
+
 
 function responsesImagePartsOf(parts) {
   if (!Array.isArray(parts)) return [];
@@ -2888,11 +2987,13 @@ function convertResponsesToChat(respReq) {
           const text = responsesTextOf(item.content);
           const images = responsesImagePartsOf(item.content);
           if (item.role === 'assistant') {
+            // assistant 消息上的图没有落点：Chat 的 assistant 内容只有文本槽
             if (text) ensurePending().content = text;
           } else if (item.role === 'system' || item.role === 'developer') {
             flushPending();
             messages.push({ role: 'system', content: text });
           } else if (images.length) {
+
             flushPending();
             messages.push({
               role: 'user',
@@ -3332,6 +3433,7 @@ async function handleResponses(req, res) {
   };
   const ccBody = buildCcRequest(chatReq);
   const promptCacheKey = chatReq.prompt_cache_key;
+  // respReq 是 Codex/客户端送来的完整会话，比 chatReq 还大一份，及时释放避免内存驻留
   chatReq = null;
   respReq = null;
 
@@ -3565,7 +3667,7 @@ async function handleResponses(req, res) {
             //  provider-metadata / tool-input-* / tool-error）全部掉进 default 打成
             // 'Unknown CC event type'，线上刷屏、把真正的错误淹掉。
             case 'text-start': case 'text-end': case 'start': case 'start-step':
-            case 'reasoning-start': case 'reasoning-end': case 'finish-step':
+            case 'reasoning-start': case 'reasoning-end':
             case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
             case 'tool-error':
               // Silent - no user-visible content
