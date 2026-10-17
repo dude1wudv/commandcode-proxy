@@ -8,7 +8,11 @@
 
 **完整功能**：OpenAI Chat Completions / **Responses API（`/v1/responses`）** + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止）| 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
 
-缓存读取量取自上游 `cachedInputTokens`；该字段未提供时读取 `inputTokenDetails.cacheReadTokens`。三个兼容接口的流式与非流式响应采用同一口径，上游明确报告的 0 不会被覆盖；本代理不估算或制造缓存命中。Chat / Responses 输入总量包含缓存，Messages 的 `input_tokens` 不包含缓存部分。
+缓存读取量取自上游 `cachedInputTokens`；该字段未提供时读取 `inputTokenDetails.cacheReadTokens`。三个兼容接口的流式与非流式响应采用同一口径，上游明确报告的缓存 0 不会被覆盖；本代理不估算或制造缓存命中。Chat / Responses 输入总量包含缓存，Messages 的 `input_tokens` 不包含缓存部分。
+
+Messages 会在流中累计已收到的文本、thinking 和工具参数的 UTF-8 字节数；缺失或无效的零输出 usage 用累计字节数除以 4 后向上取整兜底。这是估算，不是模型 tokenizer；最终上游正输出 usage 优先，输入与缓存只使用已知的上游用量。正常响应和流错误的 `usage.output_tokens_estimated` 标记估算来源，内部请求日志也保存该标记。断流仍返回错误，空流不会凭空生成输出用量。累计值在请求结束或断连后记录一次，并非逐秒持久化扣款；进程突然退出前尚未落库的请求不由此机制保证。
+
+Messages 默认上游读空闲时限为 180 秒，显式设置 `CC_STREAM_IDLE_MS` 可覆盖；Chat / Responses 仍为 30 秒。上游返回 200 后，首字静默阶段也会在约 10 秒发出 Messages SSE 心跳，之后错误以 SSE 返回且不透明重放请求。下游心跳不会延长上游空闲时限。
 
 **社区**: [Linux.do](https://linux.do) — 一个友好的中文技术社区。
 
@@ -138,7 +142,7 @@ commandcode/
 | `CC_EMPTY_SYSTEM_PLACEHOLDER` | `true` | 无 system prompt 时发空格占位；`false` 关掉 → `emptySystemPlaceholder` |
 | `CC_MAX_BODY_MB` | `100` | 请求体上限（MB），超限返回 `413` |
 | `CC_MAX_TOOL_IMAGE_MB` | `6` | 单请求内工具截图（base64）总预算，超预算的老图换成占位；`0` 关闭，见[工具截图预算](#工具截图预算) |
-| `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时，见[上游空闲超时](#上游空闲超时) |
+| `CC_STREAM_IDLE_MS` | Messages `180000`；Chat / Responses `30000` | 流式上游读空闲超时；显式设置会覆盖所有协议，见[上游空闲超时](#上游空闲超时) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式上游读空闲超时（同上）|
 | `CC_UPSTREAM_RETRY_MAX` | `2` | 上游「未吐字前闪断」的内部重试次数；`0` = 关闭，见[上游闪断重试](#上游闪断重试) |
 | `CC_UPSTREAM_RETRY_BASE_MS` | `400` | 重试退避基数（毫秒），实际退避 = base × 尝试序号 |
@@ -516,7 +520,7 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 | **设备档案单一真源** | 指纹 / `config.environment` / `config.workingDir` / `x-project-slug` / lifecycle 的 `os` 共用同一份 `DEVICE_PROFILE`（`win32` / `x64`）—— 既不会自相矛盾（"指纹说 win32、环境说 linux"），也不把宿主真实平台、Node 版本、cwd 交给上游 |
 | **思考强度** | `reasoning_effort` 透传 (low/medium/high/max) |
 | **API Key 格式验证** | 对 `Authorization: Bearer` 或 `x-api-key` 用正则 `user_[a-zA-Z0-9_-]+` 提取，自动清理多余路径/前缀，`sk-xxx` 等非 `user_` 格式拒 |
-| **流式超时保护** | 流式 30s、非流式 90s → 429 + SDK 自动重试 |
+| **流式超时保护** | Messages 空闲 180s、Chat / Responses 空闲 30s、非流式空闲 90s；已开始的流以 error 收尾 |
 | **连续超时阈值** | 连续 3 次超时后才提示压缩上下文 |
 | **零输出防护** | 尚未写出响应头时 outputTokens=0 → 429 `rate_limit_error`；Responses 流若已经发出 `created`，改为 `response.failed`，不再谎报 `completed` |
 | **上游中止** | 客户端断连 + 全部错误路径 `AbortController` 打断 CC |
@@ -644,11 +648,11 @@ CC_MAX_INFLIGHT=32 npm start    # 最多同时处理 32 个请求
 
 ## 上游空闲超时
 
-两个上游读空闲看门狗，超时后返回 `429`（带 `retry_after`）让 SDK 自动重试：
+上游读空闲看门狗超时后，尚未开始的响应返回 `429`（带 `retry_after`）；已发送的 Messages 流返回带累计 usage 的 SSE error，不会被代理重放：
 
 | 环境变量 | 默认 | 作用于 |
 |---|---|---|
-| `CC_STREAM_IDLE_MS` | `30000` | 流式请求 |
+| `CC_STREAM_IDLE_MS` | Messages `180000`；Chat / Responses `30000` | 流式请求；显式设置覆盖所有协议 |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式请求 |
 
 **语义**：只计「`reader.read()` 的等待时间」，每收到一个 chunk 就重置 —— **不是整个请求的总时长**。
@@ -656,10 +660,10 @@ CC_MAX_INFLIGHT=32 npm start    # 最多同时处理 32 个请求
 
 **默认值与官方 CLI 不一致，这是已知取舍**（[#19](https://github.com/MAXeaglet/commandcode-proxy/issues/19)）：
 官方 CLI 的 `/alpha/generate` **仍然不传** idle timeout —— 对照 `command-code@1.81.0`，`createApiClient({ baseUrl })` 不带 `timeout`（只有 sandbox transport 传了 300 秒，本代理不走那条路径），实测 700+ 秒的停顿可正常完成。
-本代理保留 30s 是为了兜住真正死掉的连接；代价是**推理模型的长思考停顿可能被误杀**。
+Messages 默认允许 180s 上游静默，Chat / Responses 保留 30s；它们都仍会回收持续无上游字节的连接。超过时限的正常长思考仍可能中断，需按实际模型时延设置覆盖值。
 
 若遇到「`429 Response timeout`」「`zero output tokens`」且日志里 `elapsedMs ≈ 30000`、`bytesReceived = 0`，
-说明是看门狗误杀了 prefill / 首 token 阶段的正常停顿 —— 调大即可：
+应结合上游与客户端日志确认是否为 prefill / 首 token 阶段的正常停顿；确认后可调大对应时限：
 
 ```bash
 CC_STREAM_IDLE_MS=300000 npm start      # 5 分钟

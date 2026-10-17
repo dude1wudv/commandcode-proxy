@@ -34,6 +34,7 @@ export interface RequestLog {
   id: number; ts: number; request_id: string; client_id: string; upstream_id: string | null; group_id: string | null;
   model: string; endpoint: string; stream: number; status: number; error_code: string | null; duration_ms: number;
   ttfb_ms: number | null; input_tokens: number; output_tokens: number; cached_tokens: number; retries: number;
+  output_tokens_estimated?: number;
 }
 export interface UsageSummary {
   from: number; to: number; group_by: string; requests: number; successes: number; input_tokens: number;

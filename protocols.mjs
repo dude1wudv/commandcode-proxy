@@ -10,6 +10,7 @@ import { readFileSync, existsSync, appendFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { parseProxyUrl, proxyFetch, proxyLabel } from './lib/proxy.mjs';
+import { createMessagesUsage } from './lib/messages-usage.mjs';
 
 const requestContext = new AsyncLocalStorage();
 export const runProtocol = (context, fn) => requestContext.run(context, fn);
@@ -257,6 +258,12 @@ const MAX_BODY_SIZE = (() => {
 const STREAM_IDLE_TIMEOUT_MS = (() => {
   const ms = Number.parseInt(process.env.CC_STREAM_IDLE_MS ?? '', 10);
   return Number.isFinite(ms) && ms > 0 ? ms : 30000;   // 默认 30s — 流式无新数据中断
+})();
+// Claude Code reasoning/tool turns can remain silent well beyond 30 seconds.
+// Count only upstream read silence; downstream pings never refresh this timer.
+const MESSAGES_IDLE_TIMEOUT_MS = (() => {
+  const ms = Number.parseInt(process.env.CC_STREAM_IDLE_MS ?? '', 10);
+  return Number.isFinite(ms) && ms > 0 ? ms : 180000;
 })();
 const NONSTREAM_IDLE_TIMEOUT_MS = (() => {
   const ms = Number.parseInt(process.env.CC_NONSTREAM_IDLE_MS ?? '', 10);
@@ -905,17 +912,12 @@ function applyCapturedCacheWrite(usage, captured) {
   return { ...usage, inputTokenDetails: { ...(usage.inputTokenDetails || {}), cacheWriteTokens: captured } };
 }
 
-// normalize CC usage stats:
-// - outputTokens=0 → zero everything (anti false billing)
+// Preserve each upstream usage field independently. A missing/zero output
+// count does not invalidate known input/cache consumption.
 function normalizeUsage(u) {
   if (!u) return;
   // CC may report cache reads only in token details. Preserve an explicit flat zero.
   u.cachedInputTokens ??= u.inputTokenDetails?.cacheReadTokens;
-  const ot = Number(u.outputTokens);
-  if (!ot) {  // 0, null, undefined, NaN → zero input + cached (anti false billing)
-    u.inputTokens = 0;
-    u.cachedInputTokens = 0;
-  }
   const context = requestContext.getStore();
   if (!context) return;
   const input = Number(u.inputTokens);
@@ -1851,19 +1853,7 @@ function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage,
     content,
     stop_reason: mapAnthropicStopReason(finishReason || 'stop'),
     stop_sequence: null,
-    usage: (() => {
-      normalizeUsage(usage || {});
-      // CC 未回报 usage 时按内容长度估算输出 token，避免客户端展示/记账为 0
-      const estOut = Math.max(1,
-        Math.ceil(((fullText || '').length + (thinkingText || '').length) / 4) + (toolCalls ? toolCalls.length * 20 : 0));
-      return {
-        // input_tokens 只计非缓存部分（Anthropic 语义），与 cache_* 相加才等于总输入
-        input_tokens: anthropicInputTokens(usage),
-        output_tokens: usage?.outputTokens || estOut,
-        cache_creation_input_tokens: usage?.inputTokenDetails?.cacheWriteTokens ?? 0,
-        cache_read_input_tokens: usage?.cachedInputTokens ?? 0,
-      };
-    })(),
+    usage,
   };
 }
 
@@ -2043,17 +2033,74 @@ function convertAnthropicToOpenAI(anthropicReq) {
  * Async generator that reads CC NDJSON response body and yields
  * Anthropic SSE events for streaming.
  */
+function createMessagesContext() {
+  const stored = requestContext.getStore();
+  if (stored) { stored.usage = null; stored.errorCode = null; }
+  const ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, upstreamError: null, incomplete: null };
+  ctx.usage = createMessagesUsage((usage, totalInput) => {
+    ctx.inputTokens = totalInput;
+    ctx.outputTokens = usage.output_tokens;
+    ctx.cachedInputTokens = usage.cache_read_input_tokens;
+    ctx.cacheWriteTokens = usage.cache_creation_input_tokens;
+    if (stored) stored.usage = {
+      input_tokens: totalInput, output_tokens: usage.output_tokens,
+      cached_tokens: usage.cache_read_input_tokens,
+      output_tokens_estimated: usage.output_tokens_estimated,
+    };
+  });
+  return ctx;
+}
+
+function messagesErrorEvent(ctx, error, status = 502, retryAfter) {
+  const stored = requestContext.getStore();
+  if (stored) { stored.status = status; stored.errorCode = error.code || error.type; }
+  return `event: error\ndata: ${JSON.stringify({
+    type: 'error', error, usage: ctx.usage.snapshot(),
+    ...(retryAfter !== undefined ? { retry_after: retryAfter } : {}),
+  })}\n\n`;
+}
+
+function messagesHaveUsage(ctx) {
+  return Boolean(ctx.inputTokens || ctx.outputTokens || ctx.cachedInputTokens || ctx.cacheWriteTokens);
+}
+
+async function* readMessagesNdjson(response, ctx) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  try {
+    while (true) {
+      // Suspend the deadline while downstream is applying backpressure.
+      // Each timer is disposed immediately after the read settles.
+      const idle = createIdleWatchdog(MESSAGES_IDLE_TIMEOUT_MS);
+      let result;
+      try { result = await Promise.race([reader.read(), idle.arm()]); }
+      finally { idle.dispose(); }
+      const { done, value } = result;
+      if (done) {
+        buffer += decoder.decode();
+        if (buffer.trim()) yield buffer;
+        break;
+      }
+      ctx.bytesReceived += value.length;
+      buffer += decoder.decode(value, { stream: true });
+      let end;
+      while ((end = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, end);
+        buffer = buffer.slice(end + 1);
+        yield line;
+      }
+    }
+  } finally {
+    try { reader.cancel().catch(() => {}); } catch {}
+  }
+}
+
 async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
   let nextBlockIndex = 0;
   let currentBlockIndex = -1;
   let currentBlockType = null;
   let blockStarted = false;
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let cachedInputTokens = 0;
-  let cacheWriteTokens = 0;
-  let capturedCacheWrite;
-  let noCacheTokens = -1;   // -1 = 上游未提供该字段，改用减法兜底
   let stopReason = null;
   // 归一化后的 finishReason（mapAnthropicStopReason 之前的值），用于判定「是否正常结束」
   let finishNorm = null;
@@ -2113,186 +2160,128 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
       role: 'assistant',
       content: [],
       model,
-      usage: { input_tokens: 0, output_tokens: 0 },
+      usage: ctx.usage.snapshot(),
     }
   })}\n\n`;
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  const idle = createIdleWatchdog(STREAM_IDLE_TIMEOUT_MS);
+  for await (const line of readMessagesNdjson(response, ctx)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed === '[DONE]') continue;
+    let event;
+    try { event = JSON.parse(trimmed); } catch { continue; }
+    if (!event.type) continue;
+    ctx.lastCcEvent = event.type;
+    ctx.usage.observe(event);
+    ctx.usage.apply(event.totalUsage || event.usage, event.type === 'finish');
 
-  try {
-    while (true) {
-      const result = await Promise.race([reader.read(), idle.arm()]);
-      const { done, value } = result;
-      if (done) break;
-      ctx.bytesReceived += value.length;
-      const chunkText = decoder.decode(value, { stream: true });
-      buffer += chunkText;
-      // 同 handleChatCompletions：无换行即无完整行，跳过全量 split
-      let lines = [];
-      if (chunkText.indexOf('\n') !== -1) {
-        lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+    switch (event.type) {
+      case 'start': case 'start-step': case 'text-start': case 'reasoning-start':
+        // Signal events, no user-visible data
+        break;
+
+      case 'reasoning-delta': {
+        // CC reasoning → Anthropic thinking block (Claude Code shows this as thinking)
+        const text = event.text || event.delta || '';
+        if (!text) break;
+        const startBlock = startThinkingBlock();
+        currentThinkingText += text;
+        yield startBlock + `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'thinking_delta', thinking: text } })}\n\n`;
+        break;
       }
 
-      let hadOutput = false;
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed === '[DONE]') continue;
-        let event;
-        try { event = JSON.parse(trimmed); } catch { continue; }
-        if (!event.type) continue;
-        ctx.lastCcEvent = event.type;
+      case 'text-delta': {
+        const text = event.text || event.delta || '';
+        if (!text) break;
+        const startBlock = startTextBlock();
+        yield startBlock + `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'text_delta', text } })}\n\n`;
+        break;
+      }
 
-        switch (event.type) {
-          case 'start': case 'start-step': case 'text-start': case 'reasoning-start':
-            // Signal events, no user-visible data
-            break;
+      case 'tool-call': {
+        // Close any pending text block
+        const closeBlock = closeTextBlock();
+        if (closeBlock) yield closeBlock;
 
-          case 'reasoning-delta': {
-            // CC reasoning → Anthropic thinking block (Claude Code shows this as thinking)
-            const text = event.text || '';
-            if (!text) break;
-            const startBlock = startThinkingBlock();
-            currentThinkingText += text;
-            yield startBlock + `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'thinking_delta', thinking: text } })}\n\n`;
-            hadOutput = true;
-            break;
-          }
+        const id = event.toolCallId || `toolu_${randomUUID().slice(0, 12)}`;
+        const name = event.toolName || '';
+        const toolInput = event.input ?? event.args;
+        const input = typeof toolInput === 'string' ? toolInput : JSON.stringify(toolInput ?? {});
 
-          case 'text-delta': {
-            const text = event.text || '';
-            const startBlock = startTextBlock();
-            yield startBlock + `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'text_delta', text } })}\n\n`;
-            outputTokens += 1;
-            hadOutput = true;
-            break;
-          }
+        const tcIndex = nextBlockIndex++;
+        yield `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: tcIndex, content_block: { type: 'tool_use', id, name, input: {} } })}\n\n`;
+        yield `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: tcIndex, delta: { type: 'input_json_delta', partial_json: input } })}\n\n`;
+        yield `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: tcIndex })}\n\n`;
+        break;
+      }
 
-          case 'tool-call': {
-            // Close any pending text block
-            const closeBlock = closeTextBlock();
-            if (closeBlock) yield closeBlock;
+      case 'cache-write-tokens': {
+        const captured = capturedCacheWriteTokens(event);
+        if (captured !== undefined) ctx.usage.cacheWrite(captured);
+        break;
+      }
 
-            const id = event.toolCallId || `toolu_${randomUUID().slice(0, 12)}`;
-            const name = event.toolName || '';
-            const input = typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {});
-
-            const tcIndex = nextBlockIndex++;
-            yield `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: tcIndex, content_block: { type: 'tool_use', id, name, input: {} } })}\n\n`;
-            yield `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: tcIndex, delta: { type: 'input_json_delta', partial_json: input } })}\n\n`;
-            yield `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: tcIndex })}\n\n`;
-            outputTokens += 20;
-            break;
-          }
-
-          case 'cache-write-tokens': {
-            const captured = capturedCacheWriteTokens(event);
-            if (captured !== undefined) capturedCacheWrite = captured;
-            break;
-          }
-
-          case 'finish-step':
-          case 'finish': {
-            // 上游的 finishReason 是 'tool-calls'（连字符），必须先过 mapFinishReason 规范化成
-            // 'tool_calls'，否则会掉进 mapAnthropicStopReason 的 default 变成 end_turn。
-            // 真机实测踩到过：工具调用成功但 stop_reason 报 end_turn。
-            sawFinish = true;   // finish-step 与 finish 都算完成信号
-            if (event.finishReason) {
-              finishNorm = mapFinishReason(event.finishReason);
-              stopReason = mapAnthropicStopReason(finishNorm);
-            }
-            const u = event.totalUsage || event.usage;
-            if (u) {
-              normalizeUsage(u);
-              inputTokens = u.inputTokens ?? inputTokens;
-              outputTokens = u.outputTokens ?? outputTokens;
-              cachedInputTokens = u.cachedInputTokens ?? u.inputTokenDetails?.cacheReadTokens ?? cachedInputTokens;
-              cacheWriteTokens = u.inputTokenDetails?.cacheWriteTokens ?? cacheWriteTokens;
-              if (typeof u.inputTokenDetails?.noCacheTokens === 'number') {
-                noCacheTokens = u.inputTokenDetails.noCacheTokens;
-              }
-              ctx.inputTokens = inputTokens;
-              ctx.outputTokens = outputTokens;
-              ctx.cachedInputTokens = cachedInputTokens;
-            }
-            // 上游未回报 usage 时保留本地按 delta 计数的估算值——清零会把有内容的
-            // 响应误判成零输出（触发 429）。未知字段保持原值即可。
-            break;
-          }
-
-          case 'error': {
-            hasError = true;
-            const upstreamError = mapCcEventError(event);
-            ctx.upstreamError = upstreamError;
-            yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: upstreamError.body.error })}\n\n`;
-            break;
-          }
-
-          case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
-            // Silent - no user-visible content
-            break;
-          default:
-            log('warn', 'Unknown CC event type', { type: event.type });
-            break;
+      case 'finish-step':
+      case 'finish': {
+        // 上游的 finishReason 是 'tool-calls'（连字符），必须先过 mapFinishReason 规范化成
+        // 'tool_calls'，否则会掉进 mapAnthropicStopReason 的 default 变成 end_turn。
+        // 真机实测踩到过：工具调用成功但 stop_reason 报 end_turn。
+        sawFinish = true;   // finish-step 与 finish 都算完成信号
+        if (event.finishReason) {
+          finishNorm = mapFinishReason(event.finishReason);
+          stopReason = mapAnthropicStopReason(finishNorm);
         }
+        break;
       }
-    }
 
-    // 无论上游是否回报 usage，都把本地计数同步进 ctx（零输出判定与超时日志依赖它）。
-    // 注意：ctx.inputTokens 保存的是上游原始总数，仅供日志排查；
-    // message_delta 的 input_tokens 走 anthropicInputTokens / noCacheTokens 换算，不读它。
-    if (!cacheWriteTokens && capturedCacheWrite !== undefined) cacheWriteTokens = capturedCacheWrite;
-    ctx.inputTokens = inputTokens;
-    ctx.outputTokens = outputTokens;
-    ctx.cachedInputTokens = cachedInputTokens;
-    ctx.cacheWriteTokens = cacheWriteTokens;
-
-    // Finalize — close pending text block, emit message_delta + message_stop
-    if (!hasError) {
-      const closeBlock = closeTextBlock();
-      if (closeBlock) yield closeBlock;
-
-      // 上游没有正常走完 finish（无 finish 事件 / provider 报连接失败）：
-      // 绝不能补一个 end_turn 就 message_stop —— 那等于把截断谎报成完整回答。
-      // 对齐 CLI：这一族一律按可重试错误处理。
-      const incomplete = incompleteUpstreamDetail(sawFinish, finishNorm);
-      if (incomplete) {
-        ctx.incomplete = incomplete;
-        log('warn', 'Upstream stream incomplete', { path: '/v1/messages', reason: incomplete });
-        yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: incompleteUpstreamError(incomplete).body.error })}\n\n`;
-      // 输出 token 为 0 时记为错误，避免下游异常计费
-      } else if (outputTokens === 0) {
-        yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Empty response from upstream (zero output tokens)' }, retry_after: 10 })}\n\n`;
-      } else {
-        yield `event: message_delta\ndata: ${JSON.stringify({
-          type: 'message_delta',
-          delta: { stop_reason: stopReason || 'end_turn' },
-          usage: {
-            output_tokens: outputTokens,
-            cache_read_input_tokens: cachedInputTokens,
-            cache_creation_input_tokens: cacheWriteTokens || 0,
-            // 只计非缓存部分；否则下游把 input 与 cache_read 相加会得到约两倍（issue #25）
-            input_tokens: noCacheTokens >= 0
-              ? noCacheTokens
-              : Math.max(0, inputTokens - cachedInputTokens - (cacheWriteTokens || 0)),
-          },
-        })}\n\n`;
-
-        yield `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`;
+      case 'error': {
+        hasError = true;
+        const upstreamError = mapCcEventError(event);
+        ctx.upstreamError = upstreamError;
+        yield messagesErrorEvent(ctx, upstreamError.body.error, upstreamError.status, upstreamError.body.retry_after);
+        break;
       }
+
+      case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
+        // Silent - no user-visible content
+        break;
+      default:
+        log('warn', 'Unknown CC event type', { type: event.type });
+        break;
     }
-  } finally {
-    // 确保流中断时通知上游
-    idle.dispose();
-    try { reader.cancel().catch(() => {}); } catch {}
+  }
+
+  // Finalize — close pending text block, emit message_delta + message_stop
+  if (!hasError) {
+    const closeBlock = closeTextBlock();
+    if (closeBlock) yield closeBlock;
+
+    // 上游没有正常走完 finish（无 finish 事件 / provider 报连接失败）：
+    // 绝不能补一个 end_turn 就 message_stop —— 那等于把截断谎报成完整回答。
+    // 对齐 CLI：这一族一律按可重试错误处理。
+    const incomplete = incompleteUpstreamDetail(sawFinish, finishNorm);
+    if (incomplete) {
+      ctx.incomplete = incomplete;
+      log('warn', 'Upstream stream incomplete', { path: '/v1/messages', reason: incomplete });
+      yield messagesErrorEvent(ctx, incompleteUpstreamError(incomplete).body.error);
+    // 输出 token 为 0 时记为错误，避免下游异常计费
+    } else if (ctx.outputTokens === 0) {
+      yield messagesErrorEvent(ctx, { type: 'rate_limit_error', message: 'Empty response from upstream (zero output tokens)' }, 429, 10);
+    } else {
+      yield `event: message_delta\ndata: ${JSON.stringify({
+        type: 'message_delta',
+        delta: { stop_reason: stopReason || 'end_turn' },
+        usage: ctx.usage.snapshot(),
+      })}\n\n`;
+
+      yield `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`;
+    }
   }
 }
 
-function sendAnthropicError(res, status, type, message, retryAfter) {
-  const body = { type: 'error', error: { type, message } };
+function sendAnthropicError(res, status, type, message, retryAfter, usage) {
+  const body = { type: 'error', error: { type, message }, ...(usage ? { usage } : {}) };
+  const stored = requestContext.getStore();
+  if (stored) { stored.status = status; stored.errorCode = type; }
   const headers = { 'Content-Type': 'application/json' };
   if (retryAfter !== undefined) {
     body.retry_after = retryAfter;
@@ -2338,19 +2327,14 @@ async function handleMessages(req, res) {
   let messageId = '';
   let reader = null;
   let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
+  let ctx;
 
   res.on('close', () => {
     if (res.writableEnded) return;
     aborted = true;
     if (!abortController.signal.aborted) {
-      try {
-        res.write(`event: message_delta\ndata: ${JSON.stringify({
-          type: 'message_delta',
-          delta: { stop_reason: 'end_turn' },
-          usage: { output_tokens: 0, input_tokens: 0, cache_read_input_tokens: 0 },
-        })}\n\n`);
-        res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
-      } catch {}
+      // The socket is already closed. Keep the last usage snapshot and abort;
+      // writing a fabricated zero-usage success cannot reach the client.
       try { abortController.abort(); } catch {}
     }
     log('warn', 'Client disconnected', {
@@ -2369,6 +2353,7 @@ async function handleMessages(req, res) {
   }
   abortController = new AbortController();
   bytesReceived = 0; lastCcEvent = ''; fullText = ''; reader = null;
+  ctx = createMessagesContext();
   try {
     // 首次初始化（fingerprint + lifecycle）
     await ensureInitialized(apiKey, abortController.signal);
@@ -2384,10 +2369,9 @@ async function handleMessages(req, res) {
 
     if (stream) {
       // ── 流式 Anthropic SSE ──
-      // 行为与 /v1/chat/completions 对齐：首个上游事件（thinking/text/tool_use）到达即
-      // 发 header——之前扣到 text_delta 才发，推理模型 thinking 阶段客户端收不到任何
-      // 字节，触发下游 60s 首字节超时（context canceled）。message_start 仍缓冲：
-      // 完全无输出时还能回 JSON 429/502 让 SDK 自动重试（同 chat 端点）。
+      // Buffer message_start only during the short pre-heartbeat window, so an
+      // immediate transport failure can still retry before committing bytes.
+      // A heartbeat commits SSE and disables retries just like real content.
       let started = false;
       const buf = [];
       const SSE_HEADERS = {
@@ -2396,36 +2380,49 @@ async function handleMessages(req, res) {
         'Connection': 'keep-alive',
         'X-Accel-Buffering': 'no',
       };
+      const writeBuffered = () => {
+        for (const ev of buf) {
+          // start/usage may have arrived upstream while message_start waited
+          // for its first content or heartbeat; publish that known usage now.
+          if (ev.startsWith('event: message_start')) {
+            const data = JSON.parse(ev.slice(ev.indexOf('data: ') + 6));
+            data.message.usage = ctx.usage.snapshot();
+            res.write(`event: message_start\ndata: ${JSON.stringify(data)}\n\n`);
+          } else res.write(ev);
+        }
+        buf.length = 0;
+      };
       const flushBuf = async () => {
         if (!started) {
           res.writeHead(200, SSE_HEADERS);
           started = true;
         }
-        for (const ev of buf) { try { res.write(ev); } catch {} }
-        buf.length = 0;
+        writeBuffered();
         await waitDrain(res);
       };
 
-      // 心跳：等价于 chat 端点的 ': keepalive'——chat 在每轮读到静默事件时发注释行，
-      // Anthropic 翻译器会吞掉 signal 事件，这里改用空闲计时发 ping（Anthropic 标准
-      // 事件，官方 SDK 会忽略），覆盖上游排队/长 thinking 的静默窗口
+      // Keep first-token silence alive too. This timer never changes the
+      // independent upstream idle deadline and never queues behind backpressure.
       let lastSentAt = Date.now();
       const heartbeat = setInterval(() => {
         // 不向已积压的下游继续塞数据：定时器回调是同步的，无法 await waitDrain，
         // 因此用 writableNeedDrain 直接跳过本轮心跳（背压场景下少发一个 ping 无副作用）
-        if (started && !aborted && !res.writableEnded && !res.writableNeedDrain && Date.now() - lastSentAt > 15000) {
+        if (!aborted && !res.writableEnded && !res.writableNeedDrain && Date.now() - lastSentAt >= 10000) {
+          if (!started) {
+            res.writeHead(200, SSE_HEADERS);
+            started = true;
+            writeBuffered();
+          }
           try { res.write('event: ping\ndata: {"type":"ping"}\n\n'); lastSentAt = Date.now(); } catch {}
         }
-      }, 5000);
+      }, 1000);
 
-      let ctx;
       try {
         messageId = 'msg_' + randomUUID().slice(0, 12);
-        ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, upstreamError: null, incomplete: null };
         const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx);
         for await (const event of generator) {
           if (aborted) break;
-          if (!started && ctx.incomplete) break;
+          if (!started && ctx.incomplete && !messagesHaveUsage(ctx)) break;
           if (!started && !event.startsWith('event: message_start')) {
             await flushBuf();
           }
@@ -2437,7 +2434,7 @@ async function handleMessages(req, res) {
             buf.push(event);
           }
         }
-        if (!started && ctx?.incomplete && !res.headersSent && attempt <= UPSTREAM_RETRY_MAX) {
+        if (!started && ctx?.incomplete && !messagesHaveUsage(ctx) && !res.headersSent && attempt <= UPSTREAM_RETRY_MAX) {
           try { reader?.cancel().catch(() => {}); } catch {}
           try { abortController.abort(); } catch {}
           await rewindUpstream('Upstream stream ended incomplete before first byte - retrying', { path: '/v1/messages', model, attempt, reason: ctx.incomplete });
@@ -2453,13 +2450,18 @@ async function handleMessages(req, res) {
                 ctx.upstreamError.status,
                 ctx.upstreamError.body.error.type,
                 ctx.upstreamError.body.error.message,
+                  ctx.upstreamError.body.retry_after,
+                  ctx.usage.snapshot(),
               );
             }
             // started 时 error 事件已在循环中经 SSE 下发，按规范 error 事件即终结
+          } else if (ctx.incomplete && !started) {
+            const err = incompleteUpstreamError(ctx.incomplete);
+            sendAnthropicError(res, err.status, err.body.error.type, err.body.error.message, err.body.retry_after, ctx.usage.snapshot());
           } else if (ctx.outputTokens === 0) {
             try { abortController.abort(); } catch {}
             if (!started) {
-              sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
+              sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10, ctx.usage.snapshot());
               return;
             }
             await flushBuf();
@@ -2475,7 +2477,7 @@ async function handleMessages(req, res) {
             path: '/v1/messages',
             model,
             streaming: true,
-            timeoutMs: STREAM_IDLE_TIMEOUT_MS,
+            timeoutMs: MESSAGES_IDLE_TIMEOUT_MS,
             elapsedMs: Date.now() - startTime,
             id: messageId,
             bytesReceived: ctx.bytesReceived,
@@ -2485,12 +2487,13 @@ async function handleMessages(req, res) {
             cachedInputTokens: ctx.cachedInputTokens,
           });
           try { abortController.abort(); } catch {} // 打断 CC 上游
+          if (!started && messagesHaveUsage(ctx)) await flushBuf();
           if (!started) {
             consecutiveTimeouts++;
             const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
               ? 'Response timeout - try reducing context length (summarize earlier messages)'
               : 'Response timeout - request timed out';
-            sendAnthropicError(res, 429, 'rate_limit_error', timeoutMsg);
+            sendAnthropicError(res, 429, 'rate_limit_error', timeoutMsg, 5, ctx.usage.snapshot());
             return;
           }
           if (!res.writableEnded) {
@@ -2499,22 +2502,23 @@ async function handleMessages(req, res) {
               ? 'Response timeout - try reducing context length (summarize earlier messages)'
               : 'Response timeout - request timed out';
             // end() 而不是 destroy()：理由见 handleChatCompletions 流式超时分支
-            try { res.end(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMsg }, retry_after: 5 })}\n\n`); } catch {}
+            try { res.end(messagesErrorEvent(ctx, { type: 'rate_limit_error', message: timeoutMsg }, 429, 5)); } catch {}
           }
-        } else if (!started && !res.headersSent && isRetryableUpstreamError(e) && attempt <= UPSTREAM_RETRY_MAX) {
+        } else if (!started && !res.headersSent && !messagesHaveUsage(ctx) && isRetryableUpstreamError(e) && attempt <= UPSTREAM_RETRY_MAX) {
           try { abortController.abort(); } catch {}
           await rewindUpstream('Upstream stream terminated before first byte - retrying', { path: '/v1/messages', model, attempt, cause: e.message });
           continue attemptLoop;
         } else {
           log('error', 'Anthropic stream error', { message: e.message });
           try { abortController.abort(); } catch {} // 打断 CC 上游
+          if (!started && messagesHaveUsage(ctx)) await flushBuf();
           if (!started) {
-            sendAnthropicError(res, 502, 'proxy_error', `Upstream error: ${e.message}`, 10);
+            sendAnthropicError(res, 502, 'proxy_error', `Upstream error: ${e.message}`, 10, ctx.usage.snapshot());
             return;
           }
           if (!res.writableEnded) {
             try {
-              res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'internal_error', message: e.message } })}\n\n`);
+              res.write(messagesErrorEvent(ctx, { type: 'internal_error', message: e.message }));
             } catch {}
           }
         }
@@ -2528,11 +2532,9 @@ async function handleMessages(req, res) {
       const messageId = 'msg_' + randomUUID().slice(0, 12);
       let finishReason = 'stop';
       let sawFinish = false;
-      let usage = null;
       let toolCalls = null;
       let thinkingText = ''; // CC reasoning → Anthropic thinking block
       let upstreamError = null;
-      let capturedCacheWrite;
 
       reader = ccResponse.body.getReader();
       const decoder = new TextDecoder();
@@ -2546,30 +2548,33 @@ async function handleMessages(req, res) {
           if (!trimmed || trimmed === '[DONE]') continue;
           try {
             const event = JSON.parse(trimmed);
+            ctx.usage.observe(event);
+            ctx.usage.apply(event.totalUsage || event.usage, event.type === 'finish');
             switch (event.type) {
-              case 'text-delta': lastCcEvent = event.type; fullText += event.text || ''; break;
-              case 'reasoning-delta': lastCcEvent = event.type; thinkingText += event.text || ''; break;
-              case 'tool-call':
+              case 'text-delta': lastCcEvent = event.type; fullText += event.text || event.delta || ''; break;
+              case 'reasoning-delta': lastCcEvent = event.type; thinkingText += event.text || event.delta || ''; break;
+              case 'tool-call': {
                 lastCcEvent = event.type;
+                const toolInput = event.input ?? event.args;
                 (toolCalls = toolCalls || []).push({
                   id: event.toolCallId || ('call_' + randomUUID().slice(0, 8)),
                   type: 'function',
                   function: {
                     name: event.toolName || '',
-                    arguments: typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {}),
+                    arguments: typeof toolInput === 'string' ? toolInput : JSON.stringify(toolInput ?? {}),
                   },
                 });
                 break;
+              }
               case 'finish-step':
               case 'finish':
                 lastCcEvent = event.type;
                 sawFinish = true;
                 finishReason = mapFinishReason(event.finishReason || 'stop');
-                if (event.totalUsage || event.usage) usage = event.totalUsage || event.usage;
                 break;
               case 'cache-write-tokens': {
                 const captured = capturedCacheWriteTokens(event);
-                if (captured !== undefined) capturedCacheWrite = captured;
+                if (captured !== undefined) ctx.usage.cacheWrite(captured);
                 break;
               }
               case 'error':
@@ -2602,21 +2607,23 @@ async function handleMessages(req, res) {
       };
 
       const idle = createIdleWatchdog(NONSTREAM_IDLE_TIMEOUT_MS);
-      while (true) {
-        const result = await Promise.race([reader.read(), idle.arm()]);
-        const { done, value } = result;
-        if (done) break;
-        bytesReceived += value.length;
-        const chunkText = decoder.decode(value, { stream: true });
-        buf += chunkText;
-        // 无换行则不可能产生完整行，跳过全量 split
-        if (chunkText.indexOf('\n') !== -1) processLines();
-      }
-      idle.dispose();
+      try {
+        while (true) {
+          const result = await Promise.race([reader.read(), idle.arm()]);
+          const { done, value } = result;
+          if (done) break;
+          bytesReceived += value.length;
+          const chunkText = decoder.decode(value, { stream: true });
+          buf += chunkText;
+          if (chunkText.indexOf('\n') !== -1) processLines();
+        }
+      } finally { idle.dispose(); }
+      // A valid final NDJSON record need not end in a newline.
+      buf += decoder.decode() + '\n';
       processLines();
 
       if (upstreamError) {
-        sendAnthropicError(res, upstreamError.status, upstreamError.body.error.type, upstreamError.body.error.message);
+        sendAnthropicError(res, upstreamError.status, upstreamError.body.error.type, upstreamError.body.error.message, upstreamError.body.retry_after, ctx.usage.snapshot());
         return;
       }
 
@@ -2624,7 +2631,7 @@ async function handleMessages(req, res) {
       {
         const incomplete = incompleteUpstreamDetail(sawFinish, finishReason);
         if (incomplete) {
-          if (!res.headersSent && attempt <= UPSTREAM_RETRY_MAX) {
+          if (!res.headersSent && !messagesHaveUsage(ctx) && attempt <= UPSTREAM_RETRY_MAX) {
             try { reader?.cancel().catch(() => {}); } catch {}
             try { abortController.abort(); } catch {}
             await rewindUpstream('Upstream stream ended incomplete before first byte - retrying', { path: '/v1/messages', model, attempt, reason: incomplete });
@@ -2633,7 +2640,7 @@ async function handleMessages(req, res) {
           log('warn', 'Upstream stream incomplete', { path: '/v1/messages', reason: incomplete });
           const err = incompleteUpstreamError(incomplete);
           try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
-          sendAnthropicError(res, err.status, err.body.error.type, err.body.error.message, err.body.retry_after);
+          sendAnthropicError(res, err.status, err.body.error.type, err.body.error.message, err.body.retry_after, ctx.usage.snapshot());
           return;
         }
       }
@@ -2642,13 +2649,12 @@ async function handleMessages(req, res) {
       // 会把有完整文本的响应误杀成 429
       if (!fullText && !thinkingText && !toolCalls) {
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
-        sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
+        sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10, ctx.usage.snapshot());
         return;
       }
 
       consecutiveTimeouts = 0;
-      usage = applyCapturedCacheWrite(usage, capturedCacheWrite);
-      sendJSON(res, 200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage, thinkingText));
+      sendJSON(res, 200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, ctx.usage.snapshot(), thinkingText));
     }
     if (attempt > 1) noteRetryRecovered({ path: '/v1/messages', model, attempt });
     return;
@@ -2678,8 +2684,8 @@ async function handleMessages(req, res) {
         ? 'Response timeout - try reducing context length (summarize earlier messages)'
         : 'Response timeout - request timed out';
       res.setHeader('Retry-After', '5');
-      sendAnthropicError(res, 429, 'rate_limit_error', timeoutMsg);
-    } else if (!res.headersSent && !aborted && isRetryableUpstreamError(e) && attempt <= UPSTREAM_RETRY_MAX) {
+      sendAnthropicError(res, 429, 'rate_limit_error', timeoutMsg, 5, ctx.usage.snapshot());
+    } else if (!res.headersSent && !aborted && !messagesHaveUsage(ctx) && isRetryableUpstreamError(e) && attempt <= UPSTREAM_RETRY_MAX) {
       try { reader?.cancel().catch(() => {}); } catch {}
       try { abortController.abort(); } catch {}
       await rewindUpstream('Upstream error before first byte - retrying', { path: '/v1/messages', model, attempt, cause: e.message });
@@ -2687,7 +2693,7 @@ async function handleMessages(req, res) {
     } else {
       log('error', 'Upstream error', { message: e.message });
       try { abortController.abort(); } catch {} // 打断 CC 上游
-      sendAnthropicError(res, 502, 'proxy_error', `Upstream error: ${e.message}`, 10);
+      sendAnthropicError(res, 502, 'proxy_error', `Upstream error: ${e.message}`, 10, ctx.usage.snapshot());
     }
   }
   }
