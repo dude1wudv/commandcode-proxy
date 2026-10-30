@@ -4,7 +4,9 @@
 
 带多账号管理控制台的 Command Code 反代代理，提供 OpenAI / Anthropic 兼容接口。
 
-当前控制台发行版：**[v1.1.1](docs/releases/v1.1.1.md)**，同步上游 [`972828a`](https://github.com/MAXeaglet/commandcode-proxy/commit/972828aff37f07c9cb12959bc6a1f4d44aaa005a)。控制台版本与模拟的上游 CLI 协议版本相互独立；后者仍为 `command-code@1.81.0`。
+当前控制台发行版：**[v1.1.2](docs/releases/v1.1.2.md)**，保留上游 [`972828a`](https://github.com/MAXeaglet/commandcode-proxy/commit/972828aff37f07c9cb12959bc6a1f4d44aaa005a) 的同步成果。控制台版本与模拟的上游 CLI 协议版本相互独立；后者仍为 `command-code@1.81.0`。
+
+本仓库维护的 package 版本为 **1.1.2**。维护时以本仓库控制台说明和 [GitHub Releases](https://github.com/dude1wudv/commandcode-proxy/releases) 为入口；源码发行不等于重部署运行中的服务，更新前须核对目标环境和部署记录。
 
 逐条对齐官方 npm 包源码（`command-code@1.81.0`；`dist/cli.mjs` 只是压缩、**没有混淆**）。上游 npm 走到更高版本时代理只打**漂移告警**，不会静默改版本号（见[反检测](#反检测)）。
 

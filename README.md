@@ -4,7 +4,9 @@
 
 A multi-account Command Code reverse proxy with a management console and OpenAI / Anthropic compatible endpoints.
 
-Current console release: **[v1.1.1](docs/releases/v1.1.1.md)**, synchronized with upstream [`972828a`](https://github.com/MAXeaglet/commandcode-proxy/commit/972828aff37f07c9cb12959bc6a1f4d44aaa005a). The console release version is separate from the emulated upstream CLI protocol version, which remains `command-code@1.81.0`.
+Current console release: **[v1.1.2](docs/releases/v1.1.2.md)**, retaining the upstream [`972828a`](https://github.com/MAXeaglet/commandcode-proxy/commit/972828aff37f07c9cb12959bc6a1f4d44aaa005a) integration. The console release version is separate from the emulated upstream CLI protocol version, which remains `command-code@1.81.0`.
+
+The maintained package version is **1.1.2**. Use this repository's console guidance and [GitHub Releases](https://github.com/dude1wudv/commandcode-proxy/releases) for source releases; publishing source does not itself redeploy a running service. Check the target environment and its deployment record before an update.
 
 Messages streams retain received text, thinking and tool-argument usage on interruption, including legacy `event.args`. Missing or invalid zero output usage falls back to the accumulated semantic UTF-8 byte count divided by four, rounded up, with `output_tokens_estimated` provenance. Positive upstream usage takes precedence; known input/cache counts are preserved, and empty streams stay at zero. This is an estimate, not a tokenizer or recovery of unseen upstream output.
 
