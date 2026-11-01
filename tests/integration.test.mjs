@@ -488,7 +488,7 @@ test('messages, responses, and chat completions all stream and buffer converted 
     protocol.checkStream(streamed.text);
     assert.equal(state.generateRequests.length, beforeStream + 1);
     assert.equal(state.generateRequests.at(-1).body.params.model, 'alpha-model');
-    assert.equal(state.generateRequests.at(-1).headers['x-command-code-version'], '1.81.0');
+    assert.equal(state.generateRequests.at(-1).headers['x-command-code-version'], '1.88.2');
     assert.equal(state.generateRequests.at(-1).headers['user-agent'], 'cli');
     assert.equal(state.generateRequests.at(-1).headers['x-cli-surface'], undefined);
     protocol.checkRequest(state.generateRequests.at(-1).body);
@@ -508,9 +508,9 @@ test('messages, responses, and chat completions all stream and buffer converted 
   assert.ok(state.initRequests.some(item => item.path === '/alpha/lifecycle-events'));
   const initForAccount = state.initRequests.filter(item => item.authorization === `Bearer ${GOOD_CREDENTIAL}`);
   assert.equal(initForAccount.length, 2);
-  for (const item of initForAccount) assert.equal(item.headers['x-command-code-version'], '1.81.0');
+  for (const item of initForAccount) assert.equal(item.headers['x-command-code-version'], '1.88.2');
   const lifecycle = initForAccount.find(item => item.path === '/alpha/lifecycle-events');
-  assert.equal(lifecycle.body.metadata.cliVersion, '1.81.0');
+  assert.equal(lifecycle.body.metadata.cliVersion, '1.88.2');
 });
 
 test('cache-write-tokens fills a zero finish write and leaves a reported write unchanged', async () => {

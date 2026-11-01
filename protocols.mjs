@@ -68,7 +68,7 @@ function loadConfig() {
 
 const CFG = loadConfig();
 
-// ── 设备指纹（形态与哈希逐字对齐官方 CLI 1.81.0） ──────
+// ── 设备指纹（形态与哈希逐字对齐官方 CLI 1.88.2） ──────
 // CPU 型号与核数对应表（仅 Windows x64）。
 // 出网的 components.cpuCount 必须是逻辑处理器数：CLI 的 gatherRawSignals 取 os.cpus().length。
 // cpuModel 与 cpuCount 明文上传，填物理核数等于宣称这台机器关了超线程。
@@ -207,11 +207,11 @@ function generateFingerprint(apiKey) {
   };
 }
 
-// 本代理**实际实现**的 wire 协议版本（对齐 command-code@1.81.0 源码）。
+// 本代理**实际实现**的 wire 协议版本（对齐 command-code@1.88.2 源码）。
 // 真机发的永远是「形状 + 版本号」自洽的组合；如果版本号跟着 npm 走而形状没变，
 // 就变成「自称最新版、却说旧方言」—— 这比版本号过期更容易被行为分析挑出来。
 // 因此这里报的是协议版本，npm 上更新了只告警、不自动改。
-const CC_PROTOCOL_VERSION = '1.81.0';
+const CC_PROTOCOL_VERSION = '1.88.2';
 let CC_VERSION = CC_PROTOCOL_VERSION;
 const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — 检查一次是否发生漂移
 const protocolDrift = { checked_at: null, implemented: CC_PROTOCOL_VERSION, latest: null, drifted: false, error: null };
@@ -271,7 +271,7 @@ const MAX_BODY_SIZE = (() => {
 })();
 // 上游读空闲超时（issue #19）：只计「reader.read() 的等待」，每收到一个 chunk 重置，
 // 不是整个请求的总时长。默认值保持不变（30s / 90s），可用环境变量覆盖 ——
-// 官方 CLI 的 /alpha/generate 仍然不传 idle timeout（对照 command-code@1.81.0，
+// 官方 CLI 的 /alpha/generate 仍然不传 idle timeout（对照 command-code@1.88.2，
 // createApiClient({ baseUrl }) 不带 timeout；只有 sandbox transport 传了 300s，本代理不走那条路径），
 // 合法的长思考停顿可达数百秒，
 // 遇到推理模型被 30s 误杀 / 触发 429 重试放大时，调大这两个值即可。
@@ -623,7 +623,7 @@ function buildCcRequest(openaiReq) {
   // 提取系统提示：OpenAI 的 system / developer 都映射为系统提示。
   // 形态对齐 CLI 的 toWireSystem —— **块数组**，非最后一块补 \n，cache_control 逐块保留。
   // （CLI 的 composeSystemPrompt：基础提示词是字符串时发字符串、是 sections 时发块数组；
-  //   对照 command-code@1.81.0，两种形态都还在。这里统一用块数组，
+  //   对照 command-code@1.88.2，两种形态都还在。这里统一用块数组，
   //   才能把客户端标在 system 上的缓存断点原样送上去。）
   const systemMsgs = messages.filter(m => m.role === 'system' || m.role === 'developer');
   const systemBlocks = [];
@@ -844,6 +844,7 @@ function createSseTranslator(model, completionId, created) {
     inputTokens: 0,
     outputTokens: 0,
     cachedInputTokens: 0,
+    get stopReason() { return finishReason; },
     /** 解析一行 NDJSON，返回 OpenAI chunk 数组 */
     parseLine(line) {
       const trimmed = line.trim();
@@ -901,7 +902,7 @@ function createSseTranslator(model, completionId, created) {
 
         case 'finish-step': {
           sawFinish = true;
-          if (event.finishReason) finishReason = mapFinishReason(event.finishReason);
+          if (event.finishReason || event.rawFinishReason) finishReason = eventFinishReason(event);
           if (event.usage) {
             usage = event.usage;
             this.inputTokens = event.usage.inputTokens ?? 0;
@@ -919,7 +920,8 @@ function createSseTranslator(model, completionId, created) {
 
         case 'finish': {
           sawFinish = true;
-          const fr = toOpenAIFinishReason(finishReason || mapFinishReason(event.finishReason || 'stop'));
+          finishReason = eventFinishReason(event);
+          const fr = toOpenAIFinishReason(finishReason);
           const u = applyCapturedCacheWrite(event.totalUsage || usage || {}, capturedCacheWrite);
           normalizeUsage(u);
           this.inputTokens = u.inputTokens ?? 0;
@@ -999,7 +1001,7 @@ function makeChunk(id, created, model, delta, finishReason, usage) {
   return `data: ${JSON.stringify(chunk)}\n\n`;
 }
 
-// command-code@1.81.0 consumeStream：`cache-write-tokens` 事件带 cacheWriteTokens。
+// command-code@1.88.2 consumeStream：`cache-write-tokens` 事件带 cacheWriteTokens。
 // finish.totalUsage 里的 cacheWriteTokens 已经非 0 时不覆盖；为 0 或缺失时才用事件值。
 function capturedCacheWriteTokens(event) {
   const n = event?.cacheWriteTokens;
@@ -1045,7 +1047,7 @@ function anthropicInputTokens(usage, noCacheOverride) {
 }
 
 // 上游 finishReason → 本代理内部规范化取值。
-// 对齐 CLI 的 normalizeStopReason2 / isNetworkFailureFinish（command-code@1.81.0）：
+// 对齐 CLI 的 normalizeStopReason2 / isNetworkFailureFinish（command-code@1.88.2）：
 //   tool_use | tool-calls | tool_calls                    → tool_calls
 //   length | max_tokens | max_output_tokens
 //          | model_context_window_exceeded                → length
@@ -1058,11 +1060,19 @@ function anthropicInputTokens(usage, noCacheOverride) {
 function mapFinishReason(reason) {
   const r = String(reason ?? '').trim().toLowerCase();
   if (!r) return 'stop';
+  if (r === 'refusal' || r === 'content_filter' || r === 'content-filter') return 'refusal';
   if (r === 'tool-calls' || r === 'tool_calls' || r === 'tool_use') return 'tool_calls';
   if (r === 'length' || r === 'max_tokens'
       || r === 'max_output_tokens' || r === 'model_context_window_exceeded') return 'length';
   if (r === 'error' || /^(?:network|connection|upstream)[-_\s]?error$/.test(r)) return 'upstream_error';
   return r;
+}
+
+// CLI 1.88.2 checks both raw and unified finish reasons for refusal.
+// Other raw provider values must not override the unified transport reason.
+function eventFinishReason(event) {
+  if ([event.rawFinishReason, event.finishReason].some(reason => mapFinishReason(reason) === 'refusal')) return 'refusal';
+  return mapFinishReason(event.finishReason || 'stop');
 }
 
 // 上游「没有正常走完」的两种情形，CLI 都当成可重试的 502：
@@ -1580,7 +1590,7 @@ async function handleChatCompletions(req, res) {
             if (!started) { sendJSON(res, err.status, err.body); return; }
             try { res.write(`data: ${JSON.stringify(err.body)}\n\n`); } catch {}
           // 输出 token 为 0 时记为错误，避免下游异常计费
-          } else if (translator.outputTokens === 0) {
+          } else if (translator.outputTokens === 0 && translator.stopReason !== 'refusal') {
             try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
             if (!started) {
               sendJSON(res, 429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
@@ -1715,7 +1725,7 @@ async function handleChatCompletions(req, res) {
               case 'finish':
                 lastCcEvent = event.type;
                 sawFinish = true;
-                finishReason = mapFinishReason(event.finishReason || 'stop');
+                finishReason = eventFinishReason(event);
                 if (event.totalUsage) usage = event.totalUsage;
                 break;
               case 'error':
@@ -1787,7 +1797,7 @@ async function handleChatCompletions(req, res) {
       }
 
       // 输出 token 为 0 时记为错误，避免下游异常计费
-      if ((usage?.outputTokens ?? 0) === 0) {
+      if ((usage?.outputTokens ?? 0) === 0 && finishReason !== 'refusal') {
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
         sendJSON(res, 429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
         return;
@@ -1910,6 +1920,7 @@ const OPENAI_FINISH_REASONS = new Set(['stop', 'length', 'tool_calls', 'content_
 
 
 function toOpenAIFinishReason(finishReason) {
+  if (finishReason === 'refusal') return 'content_filter';
   if (finishReason === 'pause_turn') return 'length';
   if (finishReason === 'upstream_error') return finishReason;
   if (OPENAI_FINISH_REASONS.has(finishReason)) return finishReason;
@@ -2322,8 +2333,9 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
         // 'tool_calls'，否则会掉进 mapAnthropicStopReason 的 default 变成 end_turn。
         // 真机实测踩到过：工具调用成功但 stop_reason 报 end_turn。
         sawFinish = true;   // finish-step 与 finish 都算完成信号
-        if (event.finishReason) {
-          finishNorm = mapFinishReason(event.finishReason);
+        if (event.type === 'finish' || event.finishReason || event.rawFinishReason) {
+          finishNorm = eventFinishReason(event);
+          ctx.finishReason = finishNorm;
           stopReason = mapAnthropicStopReason(finishNorm);
         }
         break;
@@ -2360,7 +2372,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
       log('warn', 'Upstream stream incomplete', { path: '/v1/messages', reason: incomplete });
       yield messagesErrorEvent(ctx, incompleteUpstreamError(incomplete).body.error);
     // 输出 token 为 0 时记为错误，避免下游异常计费
-    } else if (ctx.outputTokens === 0) {
+    } else if (ctx.outputTokens === 0 && ctx.finishReason !== 'refusal') {
       yield messagesErrorEvent(ctx, { type: 'rate_limit_error', message: 'Empty response from upstream (zero output tokens)' }, 429, 10);
     } else {
       yield `event: message_delta\ndata: ${JSON.stringify({
@@ -2555,7 +2567,7 @@ async function handleMessages(req, res) {
           } else if (ctx.incomplete && !started) {
             const err = incompleteUpstreamError(ctx.incomplete);
             sendAnthropicError(res, err.status, err.body.error.type, err.body.error.message, err.body.retry_after, ctx.usage.snapshot());
-          } else if (ctx.outputTokens === 0) {
+          } else if (ctx.outputTokens === 0 && ctx.finishReason !== 'refusal') {
             try { abortController.abort(); } catch {}
             if (!started) {
               sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10, ctx.usage.snapshot());
@@ -2667,7 +2679,7 @@ async function handleMessages(req, res) {
               case 'finish':
                 lastCcEvent = event.type;
                 sawFinish = true;
-                finishReason = mapFinishReason(event.finishReason || 'stop');
+                finishReason = eventFinishReason(event);
                 break;
               case 'cache-write-tokens': {
                 const captured = capturedCacheWriteTokens(event);
@@ -2744,7 +2756,7 @@ async function handleMessages(req, res) {
 
       // 零输出判定改为按实际内容：上游偶发不回 totalUsage 时，旧逻辑（usage?.outputTokens ?? 0 === 0）
       // 会把有完整文本的响应误杀成 429
-      if (!fullText && !thinkingText && !toolCalls) {
+      if (!fullText && !thinkingText && !toolCalls && finishReason !== 'refusal') {
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
         sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10, ctx.usage.snapshot());
         return;
@@ -3019,7 +3031,7 @@ function convertResponsesToChat(respReq) {
           // 绝不能 JSON.stringify 成文本送上游：base64 会按文本分词，真机实测单张 2.76MB 截图 ≈ 1.92M token，
           // 直接撞穿模型 1M 窗口（"maximum context length is 1048576 tokens ... 1922800 in the messages"）。
           // 官方 CLI 的排布是：tool-result 只放文本，图片提出来放进紧跟其后的一条 user 消息
-          // （对照 command-code@1.81.0 dist/cli.mjs 的 toWireMessages / toWireToolOutput：tool-result 仍只有文本）。
+          // （对照 command-code@1.88.2 dist/cli.mjs 的 toWireMessages / toWireToolOutput：tool-result 仍只有文本）。
           const { text, images } = splitToolOutput(item.output);
           messages.push({ role: 'tool', tool_call_id: item.call_id || '', content: text });
           if (images.length) {
@@ -3124,15 +3136,16 @@ function buildResponsesObject(responseId, model, created, fullText, thinkingText
   const o = opts || {};
   const truncated = o.finishReason === 'length';
   const paused = o.finishReason === 'pause_turn';
+  const refused = o.finishReason === 'refusal';
   return {
     id: responseId,
     object: 'response',
     created_at: created,
-    status: (truncated || paused) ? 'incomplete' : 'completed',
+    status: (truncated || paused || refused) ? 'incomplete' : 'completed',
     completed_at: nowUnix(),
     error: null,
     incomplete_details: truncated ? { reason: 'max_output_tokens' }
-      : paused ? { reason: 'pause_turn' } : null,
+      : paused ? { reason: 'pause_turn' } : refused ? { reason: 'content_filter' } : null,
     input: o.input || [],
     instructions: o.instructions === undefined ? null : o.instructions,
     max_output_tokens: o.max_output_tokens === undefined ? null : o.max_output_tokens,
@@ -3315,7 +3328,7 @@ function createResponsesSseTranslator(model, responseId, created) {
           sawFinish = true;
           // 必须归一化：截断类不止 'length'（还有 max_output_tokens /
           // model_context_window_exceeded），原来直接比对原始值会漏判成 completed。
-          finishReason = event.finishReason ? mapFinishReason(event.finishReason) : null;
+          finishReason = eventFinishReason(event);
           const u = event.totalUsage || event.usage || null;
           if (u) {
             normalizeUsage(u);
@@ -3365,11 +3378,12 @@ function createResponsesSseTranslator(model, responseId, created) {
       // 'pause_turn' 同样是「后面还有内容没发完」，规范要求 status=incomplete。
       const truncated = finishReason === 'length';
       const paused = finishReason === 'pause_turn';
-      out.push(sse(truncated || paused ? 'response.incomplete' : 'response.completed', {
-        response: Object.assign(baseResponse(truncated || paused ? 'incomplete' : 'completed', doneItems.slice()), {
+      const refused = finishReason === 'refusal';
+      out.push(sse(truncated || paused || refused ? 'response.incomplete' : 'response.completed', {
+        response: Object.assign(baseResponse(truncated || paused || refused ? 'incomplete' : 'completed', doneItems.slice()), {
           output_text: textAcc,
           incomplete_details: truncated ? { reason: 'max_output_tokens' }
-            : paused ? { reason: 'pause_turn' } : null,
+            : paused ? { reason: 'pause_turn' } : refused ? { reason: 'content_filter' } : null,
           usage: buildResponsesUsage(applyCapturedCacheWrite(usage, capturedCacheWrite), this.outputTokens),
         }),
       }));
@@ -3549,7 +3563,7 @@ async function handleResponses(req, res) {
             }
             const failed = translator.fail(translator.upstreamError.body.error.message);
             if (failed.length) await writeEvents(failed);
-          } else if (translator.outputTokens === 0 && !translator.hasOutput) {
+          } else if (translator.outputTokens === 0 && !translator.hasOutput && translator.stopReason !== 'refusal') {
             try { if (!abortController.signal.aborted) abortController.abort(); } catch (e2) {}
             if (!started) {
               sendResponsesError(res, 429, 'rate_limit_error',
@@ -3642,7 +3656,7 @@ async function handleResponses(req, res) {
             case 'finish':
               lastCcEvent = event.type;
               sawFinish = true;
-              finishReason = mapFinishReason(event.finishReason || 'stop');
+              finishReason = eventFinishReason(event);
               if (event.totalUsage || event.usage) usage = event.totalUsage || event.usage;
               break;
             case 'cache-write-tokens': {
@@ -3717,7 +3731,7 @@ async function handleResponses(req, res) {
         }
       }
 
-      if (!fullText && !thinkingText && !toolCalls.length) {
+      if (!fullText && !thinkingText && !toolCalls.length && finishReason !== 'refusal') {
         try { if (!abortController.signal.aborted) abortController.abort(); } catch (e2) {}
         sendResponsesError(res, 429, 'rate_limit_error',
           'Empty response from upstream (zero output tokens)', 10);

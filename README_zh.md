@@ -4,15 +4,17 @@
 
 带多账号管理控制台的 Command Code 反代代理，提供 OpenAI / Anthropic 兼容接口。
 
-当前控制台发行版：**[v1.1.2](docs/releases/v1.1.2.md)**，保留上游 [`972828a`](https://github.com/MAXeaglet/commandcode-proxy/commit/972828aff37f07c9cb12959bc6a1f4d44aaa005a) 的同步成果。控制台版本与模拟的上游 CLI 协议版本相互独立；后者仍为 `command-code@1.81.0`。
+当前控制台发行版：**[v1.1.2](docs/releases/v1.1.2.md)**，保留上游 [`972828a`](https://github.com/MAXeaglet/commandcode-proxy/commit/972828aff37f07c9cb12959bc6a1f4d44aaa005a) 的同步成果。控制台版本与模拟的上游 CLI 协议版本相互独立；后者已按官方 npm 源码适配到 `command-code@1.88.2`，见[适配核验](docs/ops/2026-11-01-cli-1.88.2-adaptation.md)。
 
 本仓库维护的 package 版本为 **1.1.2**。维护时以本仓库控制台说明和 [GitHub Releases](https://github.com/dude1wudv/commandcode-proxy/releases) 为入口；源码发行不等于重部署运行中的服务，更新前须核对目标环境和部署记录。
 
-逐条对齐官方 npm 包源码（`command-code@1.81.0`；`dist/cli.mjs` 只是压缩、**没有混淆**）。上游 npm 走到更高版本时代理只打**漂移告警**，不会静默改版本号（见[反检测](#反检测)）。
+逐条对齐官方 npm 包源码（`command-code@1.88.2`；`dist/cli.mjs` 只是压缩、**没有混淆**）。上游 npm 走到更高版本时代理只打**漂移告警**，不会静默改版本号（见[反检测](#反检测)）。
 
 **完整功能**：OpenAI Chat Completions / **Responses API（`/v1/responses`）** + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止）| 零输出防护（非流式 429 / 流式 response.failed）| 连续超时 → 429 自动重试 | 隐私保护日志
 
 缓存读取量取自上游 `cachedInputTokens`；该字段未提供时读取 `inputTokenDetails.cacheReadTokens`。三个兼容接口的流式与非流式响应采用同一口径，上游明确报告的缓存 0 不会被覆盖；本代理不估算或制造缓存命中。Chat / Responses 输入总量包含缓存，Messages 的 `input_tokens` 不包含缓存部分。
+
+CLI 1.88.2 的 `refusal`、`content_filter`、`content-filter`（含 `rawFinishReason`）统一识别为拒绝：Chat 返回 `content_filter`，Messages 返回 `refusal`，本地转译 Responses 返回 `incomplete` / `content_filter`。明确的拒绝终态即使零输出也不会误报成可重试的空响应，已知用量仍保留。
 
 Messages 会在流中累计已收到的文本、thinking 和工具参数的 UTF-8 字节数；缺失或无效的零输出 usage 用累计字节数除以 4 后向上取整兜底。这是估算，不是模型 tokenizer；最终上游正输出 usage 优先，输入与缓存只使用已知的上游用量。正常响应和流错误的 `usage.output_tokens_estimated` 标记估算来源，内部请求日志也保存该标记。断流仍返回错误，空流不会凭空生成输出用量。累计值在请求结束或断连后记录一次，并非逐秒持久化扣款；进程突然退出前尚未落库的请求不由此机制保证。
 
@@ -552,10 +554,10 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 | **设备指纹** | 每个 Key 首次请求前发送 `POST /alpha/fingerprint/record`；信号值（Windows MachineGuid 形状、真实形状的 MAC、`DESKTOP-xxxxxx` 主机名）由 API key **确定性派生**，并按 CLI 的算法哈希 —— 同一个 key 永远报告同一台设备：重启、内存回收、多实例都一致（用 `CC_FINGERPRINT_SALT` 成批换身份）|
 | **生命周期声明** | Key 初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`，metadata `{sessionId, cliVersion, mode, os}`）|
 | **内容派生 Session** | 客户端未提供会话标识时，用 API key、模型、system 和开头的 user 文本派生稳定 UUID，同时作为 `x-session-id` 与 `threadId` |
-| **协议版本号** | `x-command-code-version` 报**实际实现的协议版本**（当前 `1.81.0`）；npm 上有新版本只打**漂移告警**，不会静默改版本号 |
+| **协议版本号** | `x-command-code-version` 报**实际实现的协议版本**（当前 `1.88.2`）；npm 上有新版本只打**漂移告警**，不会静默改版本号 |
 | **CLI 信封格式** | 9 键：`config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
-| **环境标识** | `x-cli-environment: production`、`x-taste-learning: "false"`、`User-Agent: cli`。交互式 CLI 不发 `x-cli-surface`（1.81.0 只在 `cmd acp` 和 `cmd rpc` 时设置） |
+| **环境标识** | `x-cli-environment: production`、`x-taste-learning: "false"`、`User-Agent: cli`。交互式 CLI 不发 `x-cli-surface`（1.88.2 只在 `cmd acp` 和 `cmd rpc` 时设置） |
 | **Project Slug** | `x-project-slug` = `slugify(DEVICE_PROFILE.projectDir)`，与 `config.workingDir` 同源（默认 `C:\Users\dev\projects\app`，用 `CC_DEVICE_PROJECT_DIR` 改）|
 | **设备档案单一真源** | 指纹 / `config.environment` / `config.workingDir` / `x-project-slug` / lifecycle 的 `os` 共用同一份 `DEVICE_PROFILE`（`win32` / `x64`）—— 既不会自相矛盾（"指纹说 win32、环境说 linux"），也不把宿主真实平台、Node 版本、cwd 交给上游 |
 | **思考强度** | `reasoning_effort` 透传 (low/medium/high/max) |
@@ -701,7 +703,7 @@ CC_MAX_INFLIGHT=32 npm start    # 最多同时处理 32 个请求
 只要上游在持续吐流就不会触发，哪怕单个请求已经跑了几十分钟。
 
 **默认值与官方 CLI 不一致，这是已知取舍**（[#19](https://github.com/MAXeaglet/commandcode-proxy/issues/19)）：
-官方 CLI 的 `/alpha/generate` **仍然不传** idle timeout —— 对照 `command-code@1.81.0`，`createApiClient({ baseUrl })` 不带 `timeout`（只有 sandbox transport 传了 300 秒，本代理不走那条路径），实测 700+ 秒的停顿可正常完成。
+官方 CLI 的 `/alpha/generate` **仍然不传** idle timeout —— 对照 `command-code@1.88.2`，`createApiClient({ baseUrl })` 不带 `timeout`（只有 sandbox transport 传了 300 秒，本代理不走那条路径），实测 700+ 秒的停顿可正常完成。
 Messages 默认允许 180s 上游静默，Chat / Responses 保留 30s；它们都仍会回收持续无上游字节的连接。超过时限的正常长思考仍可能中断，需按实际模型时延设置覆盖值。
 
 若遇到「`429 Response timeout`」「`zero output tokens`」且日志里 `elapsedMs ≈ 30000`、`bytesReceived = 0`，

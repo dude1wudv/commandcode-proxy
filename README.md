@@ -4,7 +4,9 @@
 
 A multi-account Command Code reverse proxy with a management console and OpenAI / Anthropic compatible endpoints.
 
-Current console release: **[v1.1.2](docs/releases/v1.1.2.md)**, retaining the upstream [`972828a`](https://github.com/MAXeaglet/commandcode-proxy/commit/972828aff37f07c9cb12959bc6a1f4d44aaa005a) integration. The console release version is separate from the emulated upstream CLI protocol version, which remains `command-code@1.81.0`.
+Current console release: **[v1.1.2](docs/releases/v1.1.2.md)**, retaining the upstream [`972828a`](https://github.com/MAXeaglet/commandcode-proxy/commit/972828aff37f07c9cb12959bc6a1f4d44aaa005a) integration. The console release version is separate from the emulated upstream CLI protocol version, now audited against `command-code@1.88.2`; see the [compatibility audit](docs/ops/2026-11-01-cli-1.88.2-adaptation.md).
+
+CLI 1.88.2 refusal aliases (`refusal`, `content_filter`, `content-filter`, including `rawFinishReason`) map to Chat `content_filter`, Messages `refusal`, and translated Responses `incomplete` with reason `content_filter`. Explicit refusals with zero output retain known usage and are not reported as retryable empty responses.
 
 The maintained package version is **1.1.2**. Use this repository's console guidance and [GitHub Releases](https://github.com/dude1wudv/commandcode-proxy/releases) for source releases; publishing source does not itself redeploy a running service. Check the target environment and its deployment record before an update.
 
@@ -544,17 +546,17 @@ The Anthropic SDK authenticates via the `x-api-key` header — supported by the 
 
 ## Anti-Detection
 
-Aligned line-by-line against the official npm package source (`command-code@1.81.0`; `dist/cli.mjs` is minified but **not obfuscated**). Newer npm releases only raise a drift **warning** — the proxy never silently bumps the version it claims:
+Aligned line-by-line against the official npm package source (`command-code@1.88.2`; `dist/cli.mjs` is minified but **not obfuscated**). Newer npm releases only raise a drift **warning** — the proxy never silently bumps the version it claims:
 
 | Mechanism | Implementation |
 |-----------|---------------|
 | **Device Fingerprint** | `POST /alpha/fingerprint/record` before first request per key; signal values (Windows MachineGuid shape, real-shaped MACs, `DESKTOP-xxxxxx` hostname) are **derived deterministically from the API key** and hashed exactly like the CLI, so one key always reports the same device — across restarts, memory reclamation and multiple instances (bulk reset via `CC_FINGERPRINT_SALT`) |
 | **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`, metadata `{sessionId, cliVersion, mode, os}`) sent in parallel with the fingerprint on key init |
 | **Content-derived session** | When the client sends no session id, a stable UUID is derived from the API key, model, system prompt and leading user text, and used as both `x-session-id` and `threadId` |
-| **Version** | `x-command-code-version` reports the **protocol version actually implemented** (currently `1.81.0`); newer npm releases only raise a drift **warning**, never a silent version bump |
+| **Version** | `x-command-code-version` reports the **protocol version actually implemented** (currently `1.88.2`); newer npm releases only raise a drift **warning**, never a silent version bump |
 | **CLI Envelope** | 9 keys: `config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
-| **Environment** | `x-cli-environment: production`, `x-taste-learning: "false"`, `User-Agent: cli`. Interactive CLI does not send `x-cli-surface` (1.81.0 sets it only for `cmd acp` and `cmd rpc`) |
+| **Environment** | `x-cli-environment: production`, `x-taste-learning: "false"`, `User-Agent: cli`. Interactive CLI does not send `x-cli-surface` (1.88.2 sets it only for `cmd acp` and `cmd rpc`) |
 | **Project Slug** | `x-project-slug` = `slugify(DEVICE_PROFILE.projectDir)` — same source as `config.workingDir` (default `C:\Users\dev\projects\app`, override with `CC_DEVICE_PROJECT_DIR`) |
 | **Single Source of Device Truth** | Fingerprint / `config.environment` / `config.workingDir` / `x-project-slug` / lifecycle `os` all read one `DEVICE_PROFILE` (`win32` / `x64`) — so they cannot contradict each other ("fingerprint says win32, environment says linux"), and the host's real platform, Node version and cwd are never handed upstream |
 | **Reasoning Effort** | `reasoning_effort` pass-through (low/medium/high/max) |
@@ -697,7 +699,7 @@ Two upstream read idle watchdogs; on expiry the proxy returns `429` (with `retry
 
 **Semantics**: they measure only the time spent waiting inside `reader.read()`, reset on every received chunk — **not the total request duration**. As long as upstream keeps emitting, the watchdog never fires, even for a request that has been running for tens of minutes.
 
-**The defaults differ from the official CLI, and that is a known trade-off** ([#19](https://github.com/MAXeaglet/commandcode-proxy/issues/19)): `/alpha/generate` still calls `createApiClient({ baseUrl })` with no `timeout` in `command-code@1.81.0` (the only timed client is the sandbox transport at 300 s, which this proxy does not use), and 700+ second stalls complete successfully. This proxy keeps 30 s to catch genuinely dead connections; the cost is that a reasoning model's long prefill/first-token stall can be killed.
+**The defaults differ from the official CLI, and that is a known trade-off** ([#19](https://github.com/MAXeaglet/commandcode-proxy/issues/19)): `/alpha/generate` still calls `createApiClient({ baseUrl })` with no `timeout` in `command-code@1.88.2` (the only timed client is the sandbox transport at 300 s, which this proxy does not use), and 700+ second stalls complete successfully. This proxy keeps 30 s to catch genuinely dead connections; the cost is that a reasoning model's long prefill/first-token stall can be killed.
 
 If you see `429 Response timeout` or `zero output tokens` where the log shows `elapsedMs ≈ 30000` and `bytesReceived = 0`, the watchdog killed a healthy stall — raise it:
 
